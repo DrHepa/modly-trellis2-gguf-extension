@@ -1,6 +1,6 @@
 # Trellis.2 GGUF — Modly Extension
 
-Convert a single image into a 3D mesh in one pass, using the [Trellis.2 GGUF](https://huggingface.co/Aero-Ex/Trellis2-GGUF) model by Aero-Ex. Quantized weights keep VRAM usage between 4 and 8 GB depending on the selected quantization level.
+Convert a single image into a 3D mesh in one pass, using the [Trellis.2 GGUF](https://huggingface.co/Aero-Ex/Trellis2-GGUF) model by Aero-Ex.
 
 ---
 
