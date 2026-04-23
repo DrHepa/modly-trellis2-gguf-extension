@@ -1,0 +1,170 @@
+{
+  "id": "trellis2",
+  "name": "Trellis.2 GGUF",
+  "type": "model",
+  "source": "https://huggingface.co/Aero-Ex/Trellis2-GGUF",
+  "description": "Aero-Ex Trellis.2 — GGUF quantized image-to-3D model (1–3 B params). Generates a geometry mesh in one pass via sparse structure + shape SLaT. Requires ~6–10 GB VRAM depending on quantization.",
+  "version": "1.0.0",
+  "author": "Aero-Ex",
+  "generator_class": "Trellis2GGUFGenerator",
+  "vram_gb": 8,
+  "tags": ["image-to-3d", "gguf", "quantized"],
+  "nodes": [
+    {
+      "id": "generate",
+      "name": "Generate Mesh",
+      "input": "image",
+      "output": "mesh",
+      "hf_repo": "Aero-Ex/Trellis2-GGUF",
+      "download_check": "pipeline.json",
+      "params_schema": [
+        {
+          "id": "pipeline_type",
+          "label": "Quality",
+          "type": "select",
+          "default": "1024_cascade",
+          "tooltip": "Resolution and number of cascade steps. Higher = better detail, slower.",
+          "options": [
+            { "value": "512",          "label": "Fast (512)" },
+            { "value": "1024",         "label": "Balanced (1024)" },
+            { "value": "1024_cascade", "label": "High (1024 cascade)" },
+            { "value": "1536_cascade", "label": "Ultra (1536 cascade)" }
+          ]
+        },
+        {
+          "id": "gguf_quant",
+          "label": "GGUF Quantization",
+          "type": "select",
+          "default": "Q5_K_M",
+          "tooltip": "GGUF quantization level. Less VRAM = slightly less accurate.",
+          "options": [
+            { "value": "Q4_K_M", "label": "Q4_K_M  (≈ 4 GB VRAM)" },
+            { "value": "Q5_K_M", "label": "Q5_K_M  (≈ 5 GB VRAM)  [recommended]" },
+            { "value": "Q6_K",   "label": "Q6_K    (≈ 6 GB VRAM)" },
+            { "value": "Q8_0",   "label": "Q8_0    (≈ 8 GB VRAM)" }
+          ]
+        },
+        {
+          "id": "ss_steps",
+          "label": "Sparse Steps",
+          "type": "int",
+          "default": 25,
+          "min": 1,
+          "max": 50,
+          "tooltip": "Diffusion steps for the sparse structure (coarse geometry). More = better quality, slower."
+        },
+        {
+          "id": "slat_steps",
+          "label": "Shape Steps",
+          "type": "int",
+          "default": 25,
+          "min": 1,
+          "max": 50,
+          "tooltip": "Diffusion steps for the geometry SLaT (fine details)."
+        },
+        {
+          "id": "foreground_ratio",
+          "label": "Foreground Ratio",
+          "type": "float",
+          "default": 0.85,
+          "min": 0.5,
+          "max": 1.0,
+          "step": 0.05,
+          "tooltip": "Proportion of the canvas occupied by the subject after background removal."
+        },
+        {
+          "id": "remesh_resolution",
+          "label": "Remesh Resolution",
+          "type": "select",
+          "default": 768,
+          "options": [
+            { "value": 512,  "label": "512  (fast, less detail — safe for 8 GB VRAM)" },
+            { "value": 768,  "label": "768  (balanced — recommended)" },
+            { "value": 1024, "label": "1024 (high detail — needs 10+ GB VRAM)" }
+          ],
+          "tooltip": "Voxel grid resolution used for the post-generation narrow-band remesh. Higher = fewer holes and junction artifacts, but more VRAM and time."
+        },
+        {
+          "id": "seed",
+          "label": "Seed",
+          "type": "int",
+          "default": -1,
+          "min": -1,
+          "max": 4294967295,
+          "tooltip": "Seed for reproducibility. -1 = random."
+        }
+      ]
+    },
+    {
+      "id": "refine",
+      "name": "Texture Mesh",
+      "input": "image",
+      "inputs": ["image", "mesh"],
+      "output": "mesh",
+      "hf_repo": "Aero-Ex/Trellis2-GGUF",
+      "download_check": "pipeline.json",
+      "params_schema": [
+        {
+          "id": "texture_resolution",
+          "label": "Texture Resolution",
+          "type": "select",
+          "default": 1024,
+          "tooltip": "Diffusion resolution for texture SLaT encoding. 1024 gives better quality.",
+          "options": [
+            { "value": 512,  "label": "512  (fast)" },
+            { "value": 1024, "label": "1024 (recommended)" }
+          ]
+        },
+        {
+          "id": "texture_size",
+          "label": "Texture Atlas Size",
+          "type": "select",
+          "default": 2048,
+          "tooltip": "Output texture atlas resolution. Larger = sharper textures.",
+          "options": [
+            { "value": 1024, "label": "1024" },
+            { "value": 2048, "label": "2048 (recommended)" }
+          ]
+        },
+        {
+          "id": "texture_steps",
+          "label": "Texture Steps",
+          "type": "int",
+          "default": 12,
+          "min": 4,
+          "max": 50,
+          "tooltip": "Diffusion steps for texture generation. More = better quality, slower."
+        },
+        {
+          "id": "texture_guidance",
+          "label": "Guidance Strength",
+          "type": "float",
+          "default": 1.0,
+          "min": 0.0,
+          "max": 5.0,
+          "step": 0.1,
+          "tooltip": "Classifier-free guidance strength for texture diffusion."
+        },
+        {
+          "id": "foreground_ratio",
+          "label": "Foreground Ratio",
+          "type": "float",
+          "default": 0.85,
+          "min": 0.5,
+          "max": 1.0,
+          "step": 0.05,
+          "tooltip": "Proportion of the canvas occupied by the subject after background removal."
+        },
+        {
+          "id": "seed",
+          "label": "Seed",
+          "type": "int",
+          "default": -1,
+          "min": -1,
+          "max": 4294967295,
+          "tooltip": "Seed for reproducibility. -1 = random."
+        }
+      ]
+    }
+  ]
+}
