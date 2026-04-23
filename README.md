@@ -10,6 +10,8 @@ Convert a single image into a 3D mesh in one pass, using the [Trellis.2 GGUF](ht
 
 The workflow above is the recommended starting point. It chains the two nodes back-to-back:
 
+![Example output — generated mesh with texture](docs/generated.png)
+
 1. **Generate Mesh** — takes an image and produces a geometry-only GLB
 2. **Texture Mesh** — takes the same image and the generated mesh, and bakes textures onto it
 
