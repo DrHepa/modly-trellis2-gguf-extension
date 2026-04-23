@@ -51,5 +51,4 @@ The workflow above is the recommended starting point. It chains the two nodes ba
 
 ## Model source
 
-Weights: [Aero-Ex/Trellis2-GGUF](https://huggingface.co/Aero-Ex/Trellis2-GGUF) on HuggingFace  
-Based on: [microsoft/TRELLIS](https://github.com/microsoft/TRELLIS)
+Weights: [Aero-Ex/Trellis2-GGUF](https://huggingface.co/Aero-Ex/Trellis2-GGUF) on HuggingFace
