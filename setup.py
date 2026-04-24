@@ -124,7 +124,7 @@ def _find_wheel_url(lib_name: str, python_tag: str, platform_tag: str, torch_ver
             return link
         return f"{index_url}{link.split('/')[-1]}"
 
-    # Normalise torch version: "2.7.0" → "27" (index uses "torch27", not "torch270")
+    # Normalise torch version: "2.7.0" -> "27" (index uses "torch27", not "torch270")
     parts = torch_ver.split(".")
     major, minor = int(parts[0]), int(parts[1])
     tv_tag = f"{major}{minor}"
@@ -220,8 +220,8 @@ def _install_triton_windows(venv: Path, torch_ver: str) -> None:
 def _install_trellis2_gguf(venv: Path) -> None:
     """
     Download ComfyUI-Trellis2-GGUF from GitHub and extract:
-      - trellis2_gguf/   → site-packages/trellis2_gguf/
-      - patch/           → site-packages/trellis2_gguf_patch/
+      - trellis2_gguf/   -> site-packages/trellis2_gguf/
+      - patch/           -> site-packages/trellis2_gguf_patch/
 
     Also applies the patches to the corresponding installed packages
     (flexible_dual_grid.py in spconv, remeshing.py in trellis2_gguf).
@@ -311,8 +311,8 @@ def _apply_patches(sp: Path, patch_dir: Path) -> None:
     Replace specific files in installed packages with the patched versions.
 
     Known patches:
-      flexible_dual_grid.py → overwrites the same file inside spconv/modules/
-      remeshing.py          → overwrites the same file inside trellis2_gguf/
+      flexible_dual_grid.py -> overwrites the same file inside spconv/modules/
+      remeshing.py          -> overwrites the same file inside trellis2_gguf/
     """
     if not patch_dir.exists():
         return
@@ -354,17 +354,17 @@ def setup(python_exe: str, ext_dir: Path, gpu_sm: int, cuda_version: int = 0) ->
         # Blackwell (RTX 50xx, B100…)
         torch_pkgs  = ["torch==2.6.0", "torchvision==0.21.0"]
         torch_index = "https://download.pytorch.org/whl/cu126"
-        print(f"[setup] GPU SM {gpu_sm}, CUDA {cuda_version} → PyTorch 2.6 + CUDA 12.6 (Blackwell)")
+        print(f"[setup] GPU SM {gpu_sm}, CUDA {cuda_version} -> PyTorch 2.6 + CUDA 12.6 (Blackwell)")
     elif gpu_sm == 0 or gpu_sm >= 70:
         # Volta / Turing / Ampere / Ada / Hopper
         torch_pkgs  = ["torch==2.6.0", "torchvision==0.21.0"]
         torch_index = "https://download.pytorch.org/whl/cu126"
-        print(f"[setup] GPU SM {gpu_sm} → PyTorch 2.6 + CUDA 12.6")
+        print(f"[setup] GPU SM {gpu_sm} -> PyTorch 2.6 + CUDA 12.6")
     else:
         # Pascal (SM 6.x) — last PyTorch with SM 6.1 support
         torch_pkgs  = ["torch==2.5.1", "torchvision==0.20.1"]
         torch_index = "https://download.pytorch.org/whl/cu118"
-        print(f"[setup] GPU SM {gpu_sm} (legacy) → PyTorch 2.5 + CUDA 11.8")
+        print(f"[setup] GPU SM {gpu_sm} (legacy) -> PyTorch 2.5 + CUDA 11.8")
 
     print("[setup] Installing PyTorch …")
     _pip(venv, "install", *torch_pkgs, "--index-url", torch_index)

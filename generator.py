@@ -4,13 +4,13 @@ Trellis.2 GGUF extension for Modly.
 Model   : https://huggingface.co/Aero-Ex/Trellis2-GGUF
 Wrapper : https://github.com/Aero-Ex/ComfyUI-Trellis2-GGUF
 
-Single Generate node : image → geometry GLB.
+Single Generate node : image -> geometry GLB.
 
 Pipeline stages:
   1. Background removal via rembg
   2. Sparse-structure diffusion  (ss_steps)
   3. Shape SLaT diffusion        (slat_steps)
-  4. Geometry export via cumesh remesh → GLB
+  4. Geometry export via cumesh remesh -> GLB
 
 Model weights are downloaded once to <models>/trellis2/generate/ and reused.
 """
@@ -548,8 +548,8 @@ class Trellis2GGUFGenerator(BaseGenerator):
                 faces = faces[:, ::-1]
 
         # Convert from TRELLIS (Z-up, front at +Y) to GLB/Three.js (Y-up, front at +Z).
-        # Steps: rotate -90° around X (Z-up → Y-up), then 180° around new Y (front +Y → +Z).
-        # Net: x→-x, y←z_trellis, z←y_trellis  (det=+1, no winding change).
+        # Steps: rotate -90° around X (Z-up -> Y-up), then 180° around new Y (front +Y -> +Z).
+        # Net: x->-x, y<-z_trellis, z<-y_trellis  (det=+1, no winding change).
         _x = verts[:, 0].copy()
         _y = verts[:, 1].copy()
         _z = verts[:, 2].copy()
