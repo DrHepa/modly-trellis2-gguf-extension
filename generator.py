@@ -205,26 +205,63 @@ class Trellis2GGUFGenerator(BaseGenerator):
 
         return str(vision_dir)
 
+    @staticmethod
+    def _find_system_ptxas() -> str | None:
+        """Return the path to the newest CUDA toolkit ptxas.exe on Windows, or None."""
+        import glob as _glob
+        import os as _os
+        candidates = _glob.glob(
+            r"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v*\bin\ptxas.exe"
+        )
+        if not candidates:
+            # Respect user-set CUDA_PATH as fallback
+            cuda_path = _os.environ.get("CUDA_PATH", "")
+            if cuda_path:
+                p = _os.path.join(cuda_path, "bin", "ptxas.exe")
+                if _os.path.isfile(p):
+                    candidates = [p]
+        if not candidates:
+            return None
+        candidates.sort(reverse=True)  # newest CUDA version first
+        return candidates[0]
+
     def _apply_blackwell_patch(self, torch) -> None:
         """
-        triton-windows 3.3.x (the version paired with torch 2.7) compiles Triton JIT
-        kernels targeting SM 9.0 (Hopper) when it encounters an unknown SM like 12.x
-        (Blackwell).  The resulting cubin cannot load on SM 12.x → "no kernel image".
+        triton-windows 3.3.x bundles a ptxas that predates Blackwell (SM 12.x).
+        It generates PTX correctly but the bundled ptxas cannot assemble it into
+        a SM 12.x cubin -> "no kernel image available".
 
-        Workaround: patch Triton's nvidia driver to report SM 9.0 for Blackwell devices.
-        The CUDA driver will then PTX-JIT the kernel to native SM 12.x code at first run
-        (forward PTX compatibility).  Slightly slower first inference, but functional.
-
-        Also attempts to switch trellis2_gguf's sparse-conv backend away from flex_gemm
-        if an alternative is registered (e.g. spconv), which avoids Triton entirely.
+        Fix strategy (tried in order):
+          1. Point TRITON_PTXAS_PATH at the user's CUDA Toolkit ptxas (12.8+),
+             which does support SM 12.x.  Triton uses it automatically.
+          2. Switch trellis2_gguf sparse-conv backend away from flex_gemm if an
+             alternative backend is registered (avoids Triton entirely).
+          3. Spoof Triton's SM detection to SM 9.0 so it generates SM 9.0 PTX;
+             the CUDA driver may PTX-JIT it to native SM 12.x (last resort,
+             not guaranteed to work).
         """
+        import os as _os
+
         sm_major, sm_minor = torch.cuda.get_device_capability()
         if sm_major < 12:
             return
 
         print(f"[Trellis2] Blackwell GPU detected (SM {sm_major}.{sm_minor}).")
 
-        # ── 1. Try non-Triton sparse-conv backend first ──────────────────── #
+        # ── 1. System ptxas (CUDA Toolkit 12.8+) ─────────────────────────── #
+        if "TRITON_PTXAS_PATH" not in _os.environ:
+            ptxas = self._find_system_ptxas()
+            if ptxas:
+                _os.environ["TRITON_PTXAS_PATH"] = ptxas
+                print(f"[Trellis2] Blackwell: TRITON_PTXAS_PATH={ptxas}")
+            else:
+                print("[Trellis2] Blackwell: CUDA Toolkit ptxas not found. "
+                      "Install CUDA Toolkit 12.8+ for best Blackwell compatibility.")
+        else:
+            print(f"[Trellis2] Blackwell: TRITON_PTXAS_PATH already set to "
+                  f"{_os.environ['TRITON_PTXAS_PATH']}")
+
+        # ── 2. Try non-Triton sparse-conv backend ─────────────────────────── #
         try:
             import trellis2_gguf.modules.sparse.conv.conv as _conv_mod
             import trellis2_gguf.config as _t2cfg
@@ -232,14 +269,13 @@ class Trellis2GGUFGenerator(BaseGenerator):
             alts = [k for k in getattr(_conv_mod, "_backends", {}) if k != current]
             if alts:
                 _t2cfg.CONV = alts[0]
-                print(f"[Trellis2] Blackwell: switched sparse-conv backend '{current}' -> '{alts[0]}'")
+                print(f"[Trellis2] Blackwell: switched sparse-conv backend "
+                      f"'{current}' -> '{alts[0]}'")
                 return
         except Exception as _e:
-            print(f"[Trellis2] Blackwell: backend switch unavailable ({_e}), trying Triton SM patch.")
+            print(f"[Trellis2] Blackwell: backend switch unavailable ({_e}).")
 
-        # ── 2. Patch Triton SM detection: report SM 9.0 for SM 12.x ──────── #
-        # triton-windows 3.3 knows SM 9.0 (Hopper) and generates valid PTX for it.
-        # CUDA's forward PTX compatibility then JIT-compiles to native SM 12.x.
+        # ── 3. Spoof SM to 9.0 (last resort) ─────────────────────────────── #
         try:
             import triton.backends.nvidia.driver as _nv_drv
             _cls = None
@@ -252,25 +288,19 @@ class Trellis2GGUFGenerator(BaseGenerator):
                 _orig_cap = _cls.get_device_capability
                 def _cap_hopper_fallback(self, device=0):
                     major, minor = _orig_cap(self, device)
-                    if major >= 12:
-                        return (9, 0)
-                    return (major, minor)
+                    return (9, 0) if major >= 12 else (major, minor)
                 _cls.get_device_capability = _cap_hopper_fallback
-                print("[Trellis2] Blackwell: Triton SM patched to 9.0 (PTX forward-compat).")
-            else:
-                # Newer triton may expose it as a module-level function
-                if hasattr(_nv_drv, "get_device_capability"):
-                    _orig_fn = _nv_drv.get_device_capability
-                    def _fn_fallback(device=0):
-                        major, minor = _orig_fn(device)
-                        if major >= 12:
-                            return (9, 0)
-                        return (major, minor)
-                    _nv_drv.get_device_capability = _fn_fallback
-                    print("[Trellis2] Blackwell: Triton SM fn patched to 9.0.")
+                print("[Trellis2] Blackwell: Triton SM spoofed to 9.0 (PTX fallback).")
+            elif hasattr(_nv_drv, "get_device_capability"):
+                _orig_fn = _nv_drv.get_device_capability
+                def _fn_fallback(device=0):
+                    major, minor = _orig_fn(device)
+                    return (9, 0) if major >= 12 else (major, minor)
+                _nv_drv.get_device_capability = _fn_fallback
+                print("[Trellis2] Blackwell: Triton SM fn spoofed to 9.0.")
         except Exception as _e:
-            print(f"[Trellis2] Blackwell: Triton SM patch failed ({_e}). "
-                  "Generation may fail — a triton-windows update for SM 12.x is required.")
+            print(f"[Trellis2] Blackwell: all patches failed ({_e}). "
+                  "Install CUDA Toolkit 12.8+ or wait for a triton-windows update.")
 
     def _load_pipeline(self, gguf_quant: str) -> None:
         import os
