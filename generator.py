@@ -206,15 +206,20 @@ class Trellis2GGUFGenerator(BaseGenerator):
         return str(vision_dir)
 
     @staticmethod
-    def _find_system_ptxas() -> str | None:
-        """Return the path to the newest CUDA toolkit ptxas.exe on Windows, or None."""
+    def _find_system_ptxas(min_cuda_ver: tuple[int, int] = (0, 0)) -> str | None:
+        """Return the path to the newest CUDA toolkit ptxas.exe >= min_cuda_ver, or None."""
         import glob as _glob
         import os as _os
+        import re as _re
+
+        def _ver(path: str) -> tuple[int, int]:
+            m = _re.search(r'CUDA[/\\]v(\d+)\.(\d+)', path, _re.IGNORECASE)
+            return (int(m.group(1)), int(m.group(2))) if m else (0, 0)
+
         candidates = _glob.glob(
             r"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v*\bin\ptxas.exe"
         )
         if not candidates:
-            # Respect user-set CUDA_PATH as fallback
             cuda_path = _os.environ.get("CUDA_PATH", "")
             if cuda_path:
                 p = _os.path.join(cuda_path, "bin", "ptxas.exe")
@@ -222,7 +227,10 @@ class Trellis2GGUFGenerator(BaseGenerator):
                     candidates = [p]
         if not candidates:
             return None
-        candidates.sort(reverse=True)  # newest CUDA version first
+        candidates = [c for c in candidates if _ver(c) >= min_cuda_ver]
+        if not candidates:
+            return None
+        candidates.sort(key=_ver, reverse=True)
         return candidates[0]
 
     def _apply_blackwell_patch(self, torch) -> None:
@@ -249,14 +257,17 @@ class Trellis2GGUFGenerator(BaseGenerator):
         print(f"[Trellis2] Blackwell GPU detected (SM {sm_major}.{sm_minor}).")
 
         # ── 1. System ptxas (CUDA Toolkit 12.8+) ─────────────────────────── #
+        # sm_120 / sm_120a (Blackwell) require ptxas >= 12.8; CUDA 12.6 will crash
+        # with "Value 'sm_120a' is not defined for option 'gpu-name'".
         if "TRITON_PTXAS_PATH" not in _os.environ:
-            ptxas = self._find_system_ptxas()
+            ptxas = self._find_system_ptxas(min_cuda_ver=(12, 8))
             if ptxas:
                 _os.environ["TRITON_PTXAS_PATH"] = ptxas
                 print(f"[Trellis2] Blackwell: TRITON_PTXAS_PATH={ptxas}")
             else:
-                print("[Trellis2] Blackwell: CUDA Toolkit ptxas not found. "
-                      "Install CUDA Toolkit 12.8+ for best Blackwell compatibility.")
+                print("[Trellis2] Blackwell: CUDA Toolkit 12.8+ ptxas not found "
+                      "(found older versions but they don't support sm_12x). "
+                      "Install CUDA Toolkit 12.8+ for native Blackwell support.")
         else:
             print(f"[Trellis2] Blackwell: TRITON_PTXAS_PATH already set to "
                   f"{_os.environ['TRITON_PTXAS_PATH']}")
@@ -276,31 +287,168 @@ class Trellis2GGUFGenerator(BaseGenerator):
             print(f"[Trellis2] Blackwell: backend switch unavailable ({_e}).")
 
         # ── 3. Spoof SM to 9.0 (last resort) ─────────────────────────────── #
+        # In Triton 3.3.x the GPU arch fed to ptxas comes from get_current_target(),
+        # not get_device_capability().  Patch both the Triton driver class method and
+        # torch.cuda.get_device_capability (the root source) so that Triton emits
+        # sm_90 PTX — CUDA driver JIT-compiles it to native sm_12x at runtime.
+        _spoofed = False
         try:
             import triton.backends.nvidia.driver as _nv_drv
-            _cls = None
-            for attr in dir(_nv_drv):
-                obj = getattr(_nv_drv, attr)
-                if isinstance(obj, type) and hasattr(obj, "get_device_capability"):
-                    _cls = obj
+
+            # Approach A: patch get_current_target (Triton 3.3.x primary path)
+            for _attr in dir(_nv_drv):
+                _obj = getattr(_nv_drv, _attr)
+                if isinstance(_obj, type) and hasattr(_obj, "get_current_target"):
+                    _orig_gct = _obj.get_current_target
+                    def _gct_spoof(self, *_a, **_kw):
+                        tgt = _orig_gct(self, *_a, **_kw)
+                        try:
+                            if tgt is not None and int(getattr(tgt, "arch", 0)) >= 120:
+                                return type(tgt)(tgt.backend, 90, tgt.warp_size)
+                        except Exception:
+                            pass
+                        return tgt
+                    _obj.get_current_target = _gct_spoof
+                    print("[Trellis2] Blackwell: Triton get_current_target spoofed to SM 9.0.")
+                    _spoofed = True
                     break
-            if _cls is not None:
-                _orig_cap = _cls.get_device_capability
-                def _cap_hopper_fallback(self, device=0):
-                    major, minor = _orig_cap(self, device)
-                    return (9, 0) if major >= 12 else (major, minor)
-                _cls.get_device_capability = _cap_hopper_fallback
-                print("[Trellis2] Blackwell: Triton SM spoofed to 9.0 (PTX fallback).")
-            elif hasattr(_nv_drv, "get_device_capability"):
-                _orig_fn = _nv_drv.get_device_capability
-                def _fn_fallback(device=0):
-                    major, minor = _orig_fn(device)
-                    return (9, 0) if major >= 12 else (major, minor)
-                _nv_drv.get_device_capability = _fn_fallback
-                print("[Trellis2] Blackwell: Triton SM fn spoofed to 9.0.")
+
+            # Approach B: older Triton — patch get_device_capability on the class
+            if not _spoofed:
+                for _attr in dir(_nv_drv):
+                    _obj = getattr(_nv_drv, _attr)
+                    if isinstance(_obj, type) and hasattr(_obj, "get_device_capability"):
+                        _orig_cap = _obj.get_device_capability
+                        def _cap_spoof(self, device=0):
+                            major, minor = _orig_cap(self, device)
+                            return (9, 0) if major >= 12 else (major, minor)
+                        _obj.get_device_capability = _cap_spoof
+                        print("[Trellis2] Blackwell: Triton get_device_capability spoofed to SM 9.0.")
+                        _spoofed = True
+                        break
+                if not _spoofed and hasattr(_nv_drv, "get_device_capability"):
+                    _orig_fn = _nv_drv.get_device_capability
+                    def _fn_spoof(device=0):
+                        major, minor = _orig_fn(device)
+                        return (9, 0) if major >= 12 else (major, minor)
+                    _nv_drv.get_device_capability = _fn_spoof
+                    print("[Trellis2] Blackwell: Triton module get_device_capability spoofed to SM 9.0.")
+                    _spoofed = True
+
         except Exception as _e:
-            print(f"[Trellis2] Blackwell: all patches failed ({_e}). "
-                  "Install CUDA Toolkit 12.8+ or wait for a triton-windows update.")
+            print(f"[Trellis2] Blackwell: Triton driver patch failed ({_e}).")
+
+        # Approach C: patch torch.cuda.get_device_capability — the root source that
+        # all Triton paths ultimately read.  Applied regardless of A/B success so
+        # any future Triton code path is also covered.
+        try:
+            import torch.cuda as _torch_cuda
+            _orig_tgdc = _torch_cuda.get_device_capability
+            def _torch_gdc_spoof(device=None):
+                cap = _orig_tgdc(device)
+                return (9, 0) if (cap and cap[0] >= 12) else cap
+            _torch_cuda.get_device_capability = _torch_gdc_spoof
+            torch.cuda.get_device_capability = _torch_gdc_spoof
+            print("[Trellis2] Blackwell: torch.cuda.get_device_capability spoofed to SM 9.0.")
+            _spoofed = True
+        except Exception as _e:
+            print(f"[Trellis2] Blackwell: torch patch failed ({_e}).")
+
+        if not _spoofed:
+            print("[Trellis2] Blackwell: all SM-spoof patches failed. "
+                  "Install CUDA Toolkit 12.8+ for native Blackwell support.")
+
+    def _probe_cumesh_remesh(self) -> None:
+        """
+        Test cumesh.remeshing.remesh_narrow_band_dc with a tiny mesh.
+
+        setup.py used to overwrite cumesh/remeshing.py with the trellis2_gguf patch,
+        replacing the original function and leaving hashmap_vox undefined.
+        If that's the case, try to locate hashmap_vox in cumesh's own namespace
+        (or its C extension) and inject it — fixing existing installs without a Repair.
+        Sets self._cumesh_remesh_ok so _export_geometry skips the expensive BVH
+        build when remesh is known-broken.
+        """
+        import torch as _t
+        self._cumesh_remesh_ok = False
+        try:
+            import cumesh as _c
+            import cumesh.remeshing as _crm
+
+            def _probe():
+                vp = _t.tensor(
+                    [[0,0,0],[1,0,0],[0,1,0],[0,0,1]], dtype=_t.float32, device="cuda"
+                )
+                fp = _t.tensor(
+                    [[0,1,2],[0,2,3],[0,1,3],[1,2,3]], dtype=_t.int32, device="cuda"
+                )
+                bvh    = _c.cuBVH(vp, fp)
+                center = vp.mean(0)
+                scale  = (vp.max(0).values - vp.min(0).values).max().item() * 2.0
+                _crm.remesh_narrow_band_dc(
+                    vp, fp,
+                    center=center, scale=scale,
+                    resolution=8, band=1, project_back=0.5, bvh=bvh,
+                )
+
+            try:
+                _probe()
+                self._cumesh_remesh_ok = True
+                print("[Trellis2] cumesh remesh: OK")
+                return
+            except NameError as ne:
+                # Extract the missing symbol name from the NameError message
+                msg = str(ne)
+                sym = msg.split("'")[1] if "'" in msg else msg.split()[-1].strip("'\"")
+                print(f"[Trellis2] cumesh remesh broken ({ne}) — attempting runtime fix...")
+
+                # Search cumesh top-level and cumesh._C for the missing symbol
+                fixed = False
+                for ns_name, ns_obj in [("cumesh", _c)]:
+                    for attr in dir(ns_obj):
+                        if sym.lower() in attr.lower():
+                            setattr(_crm, sym, getattr(ns_obj, attr))
+                            print(f"[Trellis2] Injected {ns_name}.{attr} -> cumesh.remeshing.{sym}")
+                            fixed = True
+                            break
+                    if fixed:
+                        break
+
+                if not fixed:
+                    try:
+                        import cumesh._C as _cc
+                        # Exact match first, then partial
+                        if hasattr(_cc, sym):
+                            setattr(_crm, sym, getattr(_cc, sym))
+                            fixed = True
+                            print(f"[Trellis2] Injected cumesh._C.{sym} -> cumesh.remeshing.{sym}")
+                        else:
+                            for attr in dir(_cc):
+                                if sym.lower() in attr.lower():
+                                    setattr(_crm, sym, getattr(_cc, attr))
+                                    fixed = True
+                                    print(f"[Trellis2] Injected cumesh._C.{attr} -> cumesh.remeshing.{sym}")
+                                    break
+                    except ImportError:
+                        pass
+
+                if not fixed:
+                    print(
+                        "[Trellis2] Could not auto-fix cumesh remesh. "
+                        "Click Repair on the Models page to reinstall the extension."
+                    )
+                    return
+
+                # Re-test after injection
+                try:
+                    _probe()
+                    self._cumesh_remesh_ok = True
+                    print("[Trellis2] cumesh remesh: fixed and verified OK")
+                except Exception as e2:
+                    print(f"[Trellis2] cumesh remesh still broken after fix ({e2}). Click Repair.")
+
+        except Exception as exc:
+            print(f"[Trellis2] cumesh remesh probe failed ({exc})")
 
     def _load_pipeline(self, gguf_quant: str) -> None:
         import os
@@ -312,6 +460,7 @@ class Trellis2GGUFGenerator(BaseGenerator):
 
         if device == "cuda":
             self._apply_blackwell_patch(torch)
+            self._probe_cumesh_remesh()
 
         pipeline = Trellis2ImageTo3DPipeline.from_pretrained(
             str(self._weights_dir),
@@ -499,8 +648,11 @@ class Trellis2GGUFGenerator(BaseGenerator):
         print(f"[Trellis2GGUFGenerator] Loaded mesh: {len(mesh.vertices)} verts, {len(mesh.faces)} faces")
 
         # --- Pre-process image ---
+        # force_cpu=True: the Trellis2 pipeline is already loaded in VRAM.
+        # rembg's onnxruntime CUDA provider crashes with error 700 under VRAM
+        # pressure, corrupting the PyTorch CUDA context for all subsequent calls.
         self._report(progress_cb, 8, "Removing background...")
-        image_pil = self._preprocess(image_bytes, fg_ratio)
+        image_pil = self._preprocess(image_bytes, fg_ratio, force_cpu=True)
         self._check_cancelled(cancel_event)
 
         # --- Run texture pipeline ---
@@ -586,6 +738,8 @@ class Trellis2GGUFGenerator(BaseGenerator):
             # o_voxel/postprocess.py). Builds a BVH on the holey mesh, then runs dual
             # contouring on a narrow band around the surface to reconstruct clean topology.
             try:
+                if not getattr(self, "_cumesh_remesh_ok", True):
+                    raise RuntimeError("cumesh remesh known-broken — skipping to fallback")
                 # Free pipeline VRAM before remesh — generation leaves tensors in cache
                 _torch.cuda.empty_cache()
                 bvh = _cumesh.cuBVH(_vt, _ft)
@@ -609,9 +763,30 @@ class Trellis2GGUFGenerator(BaseGenerator):
                 # and simplification on remeshed topology reintroduces artifacts.
                 print("[Trellis2GGUFGenerator] Remesh OK")
             except Exception as remesh_exc:
-                print(f"[Trellis2GGUFGenerator] Remesh unavailable ({remesh_exc}), falling back to fill_holes")
-                # OOM leaves CUDA in corrupted state — reset before any further ops
+                # Root cause: setup.py's _apply_patches used to overwrite cumesh's
+                # own remeshing.py with trellis2_gguf's patch, which references
+                # hashmap_vox without importing it (NameError). Fixed in setup.py;
+                # reinstalling the extension (Repair) restores cumesh's remeshing.py.
+                print(f"[Trellis2GGUFGenerator] cumesh remesh unavailable ({remesh_exc}), using fallback...")
                 _torch.cuda.empty_cache()
+                # Try pymeshlab for hole-filling — handles structural holes better
+                # than CuMesh.fill_holes for FDG meshes with missing boundary voxels.
+                try:
+                    import pymeshlab as _pml
+                    ms = _pml.MeshSet()
+                    ms.add_mesh(_pml.Mesh(
+                        vertex_matrix=_vt.cpu().numpy().astype(np.float64),
+                        face_matrix=_ft.cpu().numpy(),
+                    ))
+                    ms.meshing_remove_duplicate_faces()
+                    ms.meshing_repair_non_manifold_edges()
+                    ms.meshing_close_holes(maxholesize=100)
+                    _pm = ms.current_mesh()
+                    _vt = _torch.from_numpy(_pm.vertex_matrix().astype(np.float32)).cuda().contiguous()
+                    _ft = _torch.from_numpy(_pm.face_matrix().astype(np.int32)).cuda().contiguous()
+                    print("[Trellis2GGUFGenerator] pymeshlab repair applied")
+                except Exception as pml_exc:
+                    print(f"[Trellis2GGUFGenerator] pymeshlab unavailable ({pml_exc}), using fill_holes")
                 cm = CuMesh()
                 cm.init(_vt, _ft)
                 cm.fill_holes(max_hole_perimeter=3e-2)
@@ -812,8 +987,14 @@ class Trellis2GGUFGenerator(BaseGenerator):
         seed = int(params.get("seed", -1))
         return random.randint(0, 2**31 - 1) if seed == -1 else seed
 
-    def _preprocess(self, image_bytes: bytes, fg_ratio: float):
-        """Background removal (rembg) + foreground crop."""
+    def _preprocess(self, image_bytes: bytes, fg_ratio: float, force_cpu: bool = False):
+        """Background removal (rembg) + foreground crop.
+
+        force_cpu=True avoids rembg using the CUDA onnxruntime provider, which
+        corrupts the PyTorch CUDA context when the Trellis2 pipeline is already
+        loaded and VRAM is under pressure (error 700 propagates to all subsequent
+        torch.cuda calls).
+        """
         import numpy as np
         from PIL import Image as PILImage
 
@@ -821,12 +1002,16 @@ class Trellis2GGUFGenerator(BaseGenerator):
 
         try:
             import rembg
-            try:
-                session = rembg.new_session()
-                image   = rembg.remove(image, session=session)
-            except Exception:
+            if force_cpu:
                 session = rembg.new_session(providers=["CPUExecutionProvider"])
                 image   = rembg.remove(image, session=session)
+            else:
+                try:
+                    session = rembg.new_session()
+                    image   = rembg.remove(image, session=session)
+                except Exception:
+                    session = rembg.new_session(providers=["CPUExecutionProvider"])
+                    image   = rembg.remove(image, session=session)
         except Exception as exc:
             print(f"[Trellis2GGUFGenerator] Background removal skipped: {exc}")
 
