@@ -187,8 +187,12 @@ def _install_cuda_wheels(venv: Path, gpu_sm: int) -> None:
 # triton-windows (Windows only)                                                #
 # --------------------------------------------------------------------------- #
 
-def _install_triton_windows(venv: Path, torch_ver: str) -> None:
-    """Install triton-windows matching the PyTorch version."""
+def _install_triton_windows(venv: Path, torch_ver: str, gpu_sm: int = 0) -> None:
+    """Install triton-windows matching the PyTorch version.
+
+    Blackwell GPUs (SM 12.x) require triton-windows >= 3.3.1 which bundles
+    ptxas 12.8 and adds SM 12.x support (triton-lang PR #8498).
+    """
     if platform.system() != "Windows":
         return
 
@@ -201,7 +205,11 @@ def _install_triton_windows(venv: Path, torch_ver: str) -> None:
     elif tv >= (2, 8):
         triton_spec = "triton-windows<3.5"
     elif tv >= (2, 7):
-        triton_spec = "triton-windows<3.4"
+        if gpu_sm >= 100:
+            # Blackwell: 3.3.1+ bundles ptxas 12.8 with SM 12.x support
+            triton_spec = "triton-windows>=3.3.1,<3.4"
+        else:
+            triton_spec = "triton-windows<3.4"
     else:
         triton_spec = "triton-windows"
 
@@ -386,7 +394,7 @@ def setup(python_exe: str, ext_dir: Path, gpu_sm: int, cuda_version: int = 0) ->
     # ── triton-windows ────────────────────────────────────────────────── #
     torch_ver = _get_torch_version(venv)
     if torch_ver:
-        _install_triton_windows(venv, torch_ver)
+        _install_triton_windows(venv, torch_ver, gpu_sm)
 
     # ── trellis2_gguf source ──────────────────────────────────────────── #
     _install_trellis2_gguf(venv)

@@ -207,31 +207,68 @@ class Trellis2GGUFGenerator(BaseGenerator):
 
     @staticmethod
     def _find_system_ptxas(min_cuda_ver: tuple[int, int] = (0, 0)) -> str | None:
-        """Return the path to the newest CUDA toolkit ptxas.exe >= min_cuda_ver, or None."""
+        """Return the path to the best ptxas.exe >= min_cuda_ver, or None.
+
+        Search order:
+          1. Standard CUDA Toolkit path (C:\\Program Files\\NVIDIA GPU Computing Toolkit\\...)
+          2. CUDA_PATH environment variable
+          3. triton-windows bundled ptxas (version detected via 'ptxas --version')
+        """
         import glob as _glob
         import os as _os
         import re as _re
+        import subprocess as _sp
 
-        def _ver(path: str) -> tuple[int, int]:
+        def _ver_from_path(path: str) -> tuple[int, int]:
             m = _re.search(r'CUDA[/\\]v(\d+)\.(\d+)', path, _re.IGNORECASE)
             return (int(m.group(1)), int(m.group(2))) if m else (0, 0)
 
-        candidates = _glob.glob(
+        def _ver_from_binary(path: str) -> tuple[int, int]:
+            try:
+                out = _sp.check_output(
+                    [path, "--version"], stderr=_sp.STDOUT, text=True, timeout=10,
+                )
+                m = _re.search(r'release (\d+)\.(\d+)', out)
+                if m:
+                    return (int(m.group(1)), int(m.group(2)))
+            except Exception:
+                pass
+            return (0, 0)
+
+        # (version, path) pairs
+        candidates: list[tuple[tuple[int, int], str]] = []
+
+        # 1. Standard CUDA Toolkit location
+        for p in _glob.glob(
             r"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v*\bin\ptxas.exe"
-        )
-        if not candidates:
-            cuda_path = _os.environ.get("CUDA_PATH", "")
-            if cuda_path:
-                p = _os.path.join(cuda_path, "bin", "ptxas.exe")
-                if _os.path.isfile(p):
-                    candidates = [p]
-        if not candidates:
+        ):
+            v = _ver_from_path(p)
+            if v != (0, 0):
+                candidates.append((v, p))
+
+        # 2. CUDA_PATH env var
+        cuda_path = _os.environ.get("CUDA_PATH", "")
+        if cuda_path:
+            p = _os.path.join(cuda_path, "bin", "ptxas.exe")
+            if _os.path.isfile(p):
+                v = _ver_from_path(p) or _ver_from_binary(p)
+                candidates.append((v, p))
+
+        # 3. triton-windows bundled ptxas (triton >= 3.4 bundles ptxas 12.8+)
+        try:
+            import triton as _triton
+            _triton_dir = Path(_triton.__file__).parent
+            for _p in _triton_dir.rglob("ptxas.exe"):
+                _v = _ver_from_binary(str(_p))
+                candidates.append((_v, str(_p)))
+        except Exception:
+            pass
+
+        eligible = [(v, p) for v, p in candidates if v >= min_cuda_ver]
+        if not eligible:
             return None
-        candidates = [c for c in candidates if _ver(c) >= min_cuda_ver]
-        if not candidates:
-            return None
-        candidates.sort(key=_ver, reverse=True)
-        return candidates[0]
+        eligible.sort(key=lambda x: x[0], reverse=True)
+        return eligible[0][1]
 
     def _apply_blackwell_patch(self, torch) -> None:
         """
@@ -265,9 +302,16 @@ class Trellis2GGUFGenerator(BaseGenerator):
                 _os.environ["TRITON_PTXAS_PATH"] = ptxas
                 print(f"[Trellis2] Blackwell: TRITON_PTXAS_PATH={ptxas}")
             else:
-                print("[Trellis2] Blackwell: CUDA Toolkit 12.8+ ptxas not found "
-                      "(found older versions but they don't support sm_12x). "
-                      "Install CUDA Toolkit 12.8+ for native Blackwell support.")
+                # Also log any ptxas that were found but are too old (diagnostic help)
+                old_ptxas = self._find_system_ptxas(min_cuda_ver=(0, 0))
+                if old_ptxas:
+                    print(f"[Trellis2] Blackwell: found ptxas at '{old_ptxas}' but it is "
+                          "older than 12.8 and does not support SM 12.x. "
+                          "Install CUDA Toolkit 12.8+ for native Blackwell support.")
+                else:
+                    print("[Trellis2] Blackwell: no ptxas found anywhere (CUDA Toolkit, "
+                          "CUDA_PATH, or triton-windows package). "
+                          "Install CUDA Toolkit 12.8+ for native Blackwell support.")
         else:
             print(f"[Trellis2] Blackwell: TRITON_PTXAS_PATH already set to "
                   f"{_os.environ['TRITON_PTXAS_PATH']}")
@@ -285,6 +329,25 @@ class Trellis2GGUFGenerator(BaseGenerator):
                 return
         except Exception as _e:
             print(f"[Trellis2] Blackwell: backend switch unavailable ({_e}).")
+
+        # ── 2b. Warn if triton-windows version predates Blackwell support ──── #
+        # triton-windows >= 3.3.1 bundles ptxas 12.8 with SM 12.x support.
+        # Older versions (3.3.0.postN < post14, plain 3.3.0) do not.
+        # If the user has an old version, suggest a Repair to upgrade it.
+        try:
+            import triton as _triton_ver
+            import re as _re
+            _m = _re.match(r"(\d+)\.(\d+)\.(\d+)", _triton_ver.__version__)
+            if _m:
+                _tv = tuple(int(x) for x in _m.groups())
+                if _tv < (3, 3, 1):
+                    print(
+                        f"[Trellis2] Blackwell WARNING: triton-windows {_triton_ver.__version__} "
+                        "is older than 3.3.1 and likely bundles a ptxas that does not support SM 12.x. "
+                        "Run a Repair in Modly to upgrade triton-windows to >=3.3.1."
+                    )
+        except Exception:
+            pass
 
         # ── 3. Spoof SM to 9.0 (last resort) ─────────────────────────────── #
         # In Triton 3.3.x the GPU arch fed to ptxas comes from get_current_target(),
@@ -594,6 +657,18 @@ class Trellis2GGUFGenerator(BaseGenerator):
                     },
                     generate_texture_slat=False,
                 )[0]
+        except RuntimeError as _exc:
+            _msg = str(_exc)
+            if "no kernel image" in _msg or ("CUDA error" in _msg and "kernel" in _msg.lower()):
+                raise RuntimeError(
+                    "GPU kernel error — your RTX 50-series (Blackwell) GPU requires a "
+                    "ptxas compiler that supports SM 12.x.\n\n"
+                    "Fix: install CUDA Toolkit 12.8 or newer from "
+                    "https://developer.nvidia.com/cuda-downloads\n"
+                    "then restart Modly. The toolkit's ptxas will be picked up automatically.\n\n"
+                    f"Original error: {_msg}"
+                ) from _exc
+            raise
         finally:
             stop_evt.set()
 
