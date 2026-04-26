@@ -10,13 +10,14 @@ Pipeline stages:
   1. Background removal via rembg
   2. Sparse-structure diffusion  (ss_steps)
   3. Shape SLaT diffusion        (slat_steps)
-  4. Geometry export via cumesh remesh -> GLB
+  4. Minimal geometry export -> GLB
 
 Model weights are downloaded once to <models>/trellis2/generate/ and reused.
 """
 from __future__ import annotations
 
 import io
+import json
 import random
 import sys
 import threading
@@ -25,6 +26,7 @@ import uuid
 from pathlib import Path
 from typing import Callable, Optional
 
+from runtime_support import AssetResolutionError, DependencyPreflight, HFAssetResolver, RuntimeEnvironment
 from services.generators.base import BaseGenerator, smooth_progress, GenerationCancelled  # noqa: F401
 
 _EXTENSION_DIR = Path(__file__).parent
@@ -32,8 +34,7 @@ _EXTENSION_DIR = Path(__file__).parent
 # HuggingFace model repo
 _HF_REPO = "Aero-Ex/Trellis2-GGUF"
 
-# Files to download: all GGUF variants + JSON configs + Vision encoder + decoders/encoders
-# (skip BF16/FP8 safetensors which add ~80 GB to the download; skip texture weights)
+# Geometry-only HF download allowlist for the clean rebuild slice.
 _HF_ALLOW_PATTERNS = [
     "pipeline.json",
     "Vision/**",
@@ -46,6 +47,59 @@ _HF_ALLOW_PATTERNS = [
     "shape/*.json",
     "shape/*.gguf",
 ]
+
+_MODEL_MANAGER_PATHS = {
+    "shape_enc_next_dc_f16c32_fp16": {
+        "config": "encoders/shape_enc_next_dc_f16c32_fp16.json",
+        "tensor": "encoders/shape_enc_next_dc_f16c32_fp16.safetensors",
+    },
+    "tex_enc_next_dc_f16c32_fp16": {
+        "config": "encoders/tex_enc_next_dc_f16c32_fp16.json",
+        "tensor": "encoders/tex_enc_next_dc_f16c32_fp16.safetensors",
+    },
+    "ss_dec_conv3d_16l8_fp16": {
+        "config": "decoders/Stage1/ss_dec_conv3d_16l8_fp16.json",
+        "tensor": "decoders/Stage1/ss_dec_conv3d_16l8_fp16.safetensors",
+    },
+    "shape_dec_next_dc_f16c32_fp16": {
+        "config": "decoders/Stage2/shape_dec_next_dc_f16c32_fp16.json",
+        "tensor": "decoders/Stage2/shape_dec_next_dc_f16c32_fp16.safetensors",
+    },
+    "tex_dec_next_dc_f16c32_fp16": {
+        "config": "decoders/Stage2/tex_dec_next_dc_f16c32_fp16.json",
+        "tensor": "decoders/Stage2/tex_dec_next_dc_f16c32_fp16.safetensors",
+    },
+    "ss_flow_img_dit_1_3B_64_bf16": {
+        "config": "refiner/ss_flow_img_dit_1_3B_64_bf16.json",
+        "tensor": "refiner/ss_flow_img_dit_1_3B_64_bf16.safetensors",
+        "tensor_precision": "refiner/ss_flow_img_dit_1_3B_64_bf16_{precision}.safetensors",
+        "gguf": "refiner/ss_flow_img_dit_1_3B_64_bf16_{gguf_quant}.gguf",
+    },
+    "slat_flow_img2shape_dit_1_3B_512_bf16": {
+        "config": "shape/slat_flow_img2shape_dit_1_3B_512_bf16.json",
+        "tensor": "shape/slat_flow_img2shape_dit_1_3B_512_bf16.safetensors",
+        "tensor_precision": "shape/slat_flow_img2shape_dit_1_3B_512_bf16_{precision}.safetensors",
+        "gguf": "shape/slat_flow_img2shape_dit_1_3B_512_bf16_{gguf_quant}.gguf",
+    },
+    "slat_flow_img2shape_dit_1_3B_1024_bf16": {
+        "config": "shape/slat_flow_img2shape_dit_1_3B_1024_bf16.json",
+        "tensor": "shape/slat_flow_img2shape_dit_1_3B_1024_bf16.safetensors",
+        "tensor_precision": "shape/slat_flow_img2shape_dit_1_3B_1024_bf16_{precision}.safetensors",
+        "gguf": "shape/slat_flow_img2shape_dit_1_3B_1024_bf16_{gguf_quant}.gguf",
+    },
+    "slat_flow_imgshape2tex_dit_1_3B_512_bf16": {
+        "config": "texture/slat_flow_imgshape2tex_dit_1_3B_512_bf16.json",
+        "tensor": "texture/slat_flow_imgshape2tex_dit_1_3B_512_bf16.safetensors",
+        "tensor_precision": "texture/slat_flow_imgshape2tex_dit_1_3B_512_bf16_{precision}.safetensors",
+        "gguf": "texture/slat_flow_imgshape2tex_dit_1_3B_512_bf16_{gguf_quant}.gguf",
+    },
+    "slat_flow_imgshape2tex_dit_1_3B_1024_bf16": {
+        "config": "texture/slat_flow_imgshape2tex_dit_1_3B_1024_bf16.json",
+        "tensor": "texture/slat_flow_imgshape2tex_dit_1_3B_1024_bf16.safetensors",
+        "tensor_precision": "texture/slat_flow_imgshape2tex_dit_1_3B_1024_bf16_{precision}.safetensors",
+        "gguf": "texture/slat_flow_imgshape2tex_dit_1_3B_1024_bf16_{gguf_quant}.gguf",
+    },
+}
 
 # Sampler params — matched to ComfyUI reference workflow (Q4 high-quality results)
 _SS_CFG            = 6.5
@@ -62,6 +116,22 @@ _SLAT_RESCALE_T    = 4.0
 # 49152 (old default) truncates complex objects — 999999 lets the model
 # use as many voxels as it needs for full detail.
 _MAX_NUM_TOKENS    = 150000
+
+
+class GenerateAdapter:
+    """Generate-only runtime slice for the clean HF rebuild."""
+
+    def __init__(self, generator: "Trellis2GGUFGenerator") -> None:
+        self._generator = generator
+
+    def generate(
+        self,
+        image_bytes: bytes,
+        params: dict,
+        progress_cb: Optional[Callable[[int, str], None]] = None,
+        cancel_event: Optional[threading.Event] = None,
+    ) -> Path:
+        return self._generator._run_generate(image_bytes, params, progress_cb, cancel_event)
 
 
 class Trellis2GGUFGenerator(BaseGenerator):
@@ -88,7 +158,11 @@ class Trellis2GGUFGenerator(BaseGenerator):
     # ------------------------------------------------------------------ #
 
     def is_downloaded(self) -> bool:
-        return (self._weights_dir / "pipeline.json").exists()
+        try:
+            HFAssetResolver.resolve_geometry(self._weights_dir)
+        except AssetResolutionError:
+            return False
+        return True
 
     def _auto_download(self) -> None:
         import os
@@ -113,6 +187,102 @@ class Trellis2GGUFGenerator(BaseGenerator):
     # ------------------------------------------------------------------ #
     # Load / Unload                                                       #
     # ------------------------------------------------------------------ #
+
+    def _python_tag(self) -> str:
+        return f"cp{sys.version_info.major}{sys.version_info.minor}"
+
+    @staticmethod
+    def _module_available(module_name: str) -> bool:
+        import importlib.util
+
+        return importlib.util.find_spec(module_name) is not None
+
+    def _resolve_generate_assets(self):
+        assets = HFAssetResolver.resolve_geometry(self._weights_dir)
+        self._geometry_assets = assets
+        return assets
+
+    def _build_runtime_environment(self, generate_assets_available: bool) -> RuntimeEnvironment:
+        import platform
+
+        torch_version = ""
+        cuda_version = ""
+        gpu_sm: str | None = None
+        try:
+            import torch
+
+            torch_version = str(torch.__version__).split("+")[0]
+            cuda_version = str(getattr(torch.version, "cuda", "") or "")
+            if torch.cuda.is_available():
+                major, minor = torch.cuda.get_device_capability()
+                gpu_sm = f"{major}{minor}"
+        except Exception:
+            pass
+
+        known_dependencies = {
+            "cumesh": self._module_available("cumesh"),
+            "o_voxel": self._module_available("o_voxel"),
+            "spconv": self._module_available("spconv"),
+            "cumm": self._module_available("cumm"),
+            "nvdiffrast": self._module_available("nvdiffrast"),
+            "flex_gemm": self._module_available("flex_gemm"),
+        }
+
+        return RuntimeEnvironment(
+            system=platform.system(),
+            machine=platform.machine(),
+            python_tag=self._python_tag(),
+            python_version=platform.python_version(),
+            torch_version=torch_version,
+            cuda_version=cuda_version,
+            gpu_sm=gpu_sm,
+            known_dependencies=known_dependencies,
+            asset_groups={"generate": generate_assets_available, "refine": False},
+            refine_lab_verified=False,
+        )
+
+    def _ensure_generate_runtime_ready(self):
+        asset_error: Exception | None = None
+        assets = None
+        try:
+            assets = self._resolve_generate_assets()
+        except AssetResolutionError as exc:
+            asset_error = exc
+
+        env = self._build_runtime_environment(generate_assets_available=assets is not None)
+        report = DependencyPreflight.evaluate("generate", env)
+        blockers = list(report.blockers)
+        if asset_error is not None:
+            blockers.append(str(asset_error))
+
+        if blockers:
+            raise RuntimeError(
+                "Generate Mesh is unavailable in this runtime environment.\n"
+                + "\n".join(f"- {blocker}" for blocker in blockers)
+            )
+
+        if assets is None:
+            raise RuntimeError("Generate Mesh assets could not be resolved.")
+        return assets
+
+    def _ensure_generate_pipeline(self, gguf_quant: str) -> None:
+        self._ensure_venv_on_path()
+
+        if not self.is_downloaded():
+            self._auto_download()
+
+        assets = self._ensure_generate_runtime_ready()
+        self._ensure_trellis2_gguf()
+
+        if self._model is not None and getattr(self, "_gguf_quant", None) == gguf_quant:
+            return
+
+        if self._model is not None:
+            print(f"[Trellis2GGUFGenerator] gguf_quant changed -> reloading ({gguf_quant})")
+            self.unload()
+            self._ensure_trellis2_gguf()
+
+        self._load_pipeline(gguf_quant, assets)
 
     def _ensure_venv_on_path(self) -> None:
         """Add the extension venv's site-packages to sys.path if not already present."""
@@ -141,19 +311,12 @@ class Trellis2GGUFGenerator(BaseGenerator):
         if self._model is not None:
             return
 
-        self._ensure_venv_on_path()
-
-        if not self.is_downloaded():
-            self._auto_download()
-
-        self._ensure_trellis2_gguf()
-
         # gguf_quant is not available at load time (no UI params yet),
-        # so default to Q5_K_M.  generate() will reload if the user
-        # picks a different quantisation on first inference.
-        self._load_pipeline("Q5_K_M")
+        # so default to Q5_K_M. generate() will reload if the user picks
+        # a different quantisation on first inference.
+        self._ensure_generate_pipeline("Q5_K_M")
 
-    def _prepare_dinov3_dir(self) -> str | None:
+    def _prepare_dinov3_dir(self, vision_dir: Path) -> str | None:
         """
         Make Vision/ loadable by DINOv3ViTModel.from_pretrained:
           - creates model.safetensors (hardlink to original .safetensors)
@@ -161,7 +324,6 @@ class Trellis2GGUFGenerator(BaseGenerator):
         Returns path to Vision/ if ready, None on failure.
         """
         import os, json, shutil
-        vision_dir = self._weights_dir / "Vision"
         if not vision_dir.exists():
             return None
 
@@ -538,7 +700,7 @@ class Trellis2GGUFGenerator(BaseGenerator):
         except Exception as exc:
             print(f"[Trellis2] cumesh remesh probe failed ({exc})")
 
-    def _load_pipeline(self, gguf_quant: str) -> None:
+    def _load_pipeline(self, gguf_quant: str, geometry_assets) -> None:
         import os
         from trellis2_gguf.pipelines import Trellis2ImageTo3DPipeline
         import torch
@@ -548,10 +710,9 @@ class Trellis2GGUFGenerator(BaseGenerator):
 
         if device == "cuda":
             self._apply_blackwell_patch(torch)
-            self._probe_cumesh_remesh()
 
         pipeline = Trellis2ImageTo3DPipeline.from_pretrained(
-            str(self._weights_dir),
+            str(geometry_assets.root),
             keep_models_loaded=False,  # free sub-models between stages to save VRAM
             enable_gguf=True,
             gguf_quant=gguf_quant,
@@ -566,14 +727,14 @@ class Trellis2GGUFGenerator(BaseGenerator):
             args = ic.get("args", {})
             model_name = args.get("model_name", "")
             if model_name and not os.path.isdir(model_name):
-                local_dir = self._prepare_dinov3_dir()
+                local_dir = self._prepare_dinov3_dir(geometry_assets.paths["Vision"])
                 if local_dir:
                     args["model_name"] = local_dir
                     print(f"[Trellis2] DINOv3 -> {local_dir}")
                 else:
-                    # Last resort: let HF download from hub
-                    args["model_name"] = "facebook/dinov3-vitl16-pretrain-lvd1689m"
-                    print("[Trellis2] DINOv3 -> HuggingFace download fallback")
+                    raise RuntimeError(
+                        "Generate Mesh cannot load DINOv3 assets from the expected Vision/ directory."
+                    )
 
         # DINOv3ViTModel.from_pretrained loads weights on CPU by default, but
         # DinoV3FeatureExtractor.__call__ always sends the input tensor to CUDA.
@@ -616,8 +777,11 @@ class Trellis2GGUFGenerator(BaseGenerator):
         cancel_event: Optional[threading.Event] = None,
     ) -> Path:
         if self.model_dir.name == "refine":
-            return self._run_refine(image_bytes, params, progress_cb, cancel_event)
-        return self._run_generate(image_bytes, params, progress_cb, cancel_event)
+            raise RuntimeError(
+                "Texture Mesh / refine is intentionally unavailable in this clean rebuild slice. "
+                "Use the generate node only."
+            )
+        return GenerateAdapter(self).generate(image_bytes, params, progress_cb, cancel_event)
 
     def _run_generate(
         self,
@@ -628,19 +792,13 @@ class Trellis2GGUFGenerator(BaseGenerator):
     ) -> Path:
         import torch
 
-        # --- Reload if quantisation changed since last call ---
         gguf_quant = str(params.get("gguf_quant", "Q5_K_M"))
-        if self._model is not None and getattr(self, "_gguf_quant", None) != gguf_quant:
-            print(f"[Trellis2GGUFGenerator] gguf_quant changed -> reloading ({gguf_quant})")
-            self.unload()
-            self._ensure_trellis2_gguf()
-            self._load_pipeline(gguf_quant)
+        self._ensure_generate_pipeline(gguf_quant)
 
         pipeline_type     = str(params.get("pipeline_type",     "1024_cascade"))
         ss_steps          = int(params.get("ss_steps",          25))
         slat_steps        = int(params.get("slat_steps",        25))
         fg_ratio          = float(params.get("foreground_ratio", 0.85))
-        remesh_resolution = int(params.get("remesh_resolution", 768))
         seed              = self._resolve_seed(params)
 
         # --- Pre-process image ---
@@ -702,95 +860,7 @@ class Trellis2GGUFGenerator(BaseGenerator):
         # --- Export ---
         self._report(progress_cb, 92, "Exporting mesh...")
         import torch as _torch_gc; _torch_gc.cuda.empty_cache()
-        path = self._export_geometry(mesh_with_voxel, remesh_resolution)
-
-        self._report(progress_cb, 100, "Done")
-        return path
-
-    def _run_refine(
-        self,
-        image_bytes: bytes,
-        params: dict,
-        progress_cb: Optional[Callable[[int, str], None]] = None,
-        cancel_event: Optional[threading.Event] = None,
-    ) -> Path:
-        """Texture an existing GLB mesh using Trellis2's native SLaT texture pipeline."""
-        import torch
-        import trimesh
-
-        mesh_path = str(params.get("mesh_path", "")).strip()
-        if not mesh_path:
-            raise ValueError("mesh_path is required for the Texture Mesh node")
-
-        texture_resolution = int(params.get("texture_resolution", 1024))
-        texture_size       = int(params.get("texture_size",       2048))
-        texture_steps      = int(params.get("texture_steps",      12))
-        texture_guidance   = float(params.get("texture_guidance", 1.0))
-        fg_ratio           = float(params.get("foreground_ratio", 0.85))
-        seed               = self._resolve_seed(params)
-
-        # Resolve workspace-relative or /workspace/... paths to absolute filesystem paths.
-        # The workflow runner passes a relative path ("Workflows/file.glb") for workspace
-        # meshes; the Generate page UI passes "/workspace/Default/file.glb".
-        # outputs_dir = WORKSPACE_DIR/collection, so its parent is WORKSPACE_DIR.
-        workspace_dir = self.outputs_dir.parent
-        mesh_p = Path(mesh_path)
-        if mesh_path.startswith("/workspace/"):
-            mesh_path = str(workspace_dir / mesh_path[len("/workspace/"):])
-        elif not mesh_p.is_absolute():
-            mesh_path = str(workspace_dir / mesh_path)
-
-        # --- Load input mesh ---
-        self._report(progress_cb, 3, "Loading mesh...")
-        mesh = trimesh.load(mesh_path, force="mesh")
-        if not isinstance(mesh, trimesh.Trimesh):
-            raise ValueError(f"Could not load a valid mesh from: {mesh_path}")
-        print(f"[Trellis2GGUFGenerator] Loaded mesh: {len(mesh.vertices)} verts, {len(mesh.faces)} faces")
-
-        # --- Pre-process image ---
-        # force_cpu=True: the Trellis2 pipeline is already loaded in VRAM.
-        # rembg's onnxruntime CUDA provider crashes with error 700 under VRAM
-        # pressure, corrupting the PyTorch CUDA context for all subsequent calls.
-        self._report(progress_cb, 8, "Removing background...")
-        image_pil = self._preprocess(image_bytes, fg_ratio, force_cpu=True)
-        self._check_cancelled(cancel_event)
-
-        # --- Run texture pipeline ---
-        self._report(progress_cb, 12, "Encoding shape SLaT...")
-        stop_evt = threading.Event()
-        if progress_cb:
-            threading.Thread(
-                target=smooth_progress,
-                args=(progress_cb, 12, 90, "SLaT texture diffusion...", stop_evt, float(texture_steps)),
-                daemon=True,
-            ).start()
-
-        try:
-            with torch.no_grad():
-                out_mesh, _, _ = self._model.texture_mesh(
-                    mesh=mesh,
-                    image=image_pil,
-                    seed=seed,
-                    tex_slat_sampler_params={
-                        "steps":             texture_steps,
-                        "guidance_strength": texture_guidance,
-                    },
-                    resolution=texture_resolution,
-                    texture_size=texture_size,
-                )
-        finally:
-            stop_evt.set()
-
-        self._check_cancelled(cancel_event)
-
-        # --- Export ---
-        self._report(progress_cb, 92, "Exporting textured mesh...")
-        import torch as _torch_gc; _torch_gc.cuda.empty_cache()
-
-        self.outputs_dir.mkdir(parents=True, exist_ok=True)
-        name = f"{int(time.time())}_{uuid.uuid4().hex[:8]}_textured.glb"
-        path = self.outputs_dir / name
-        out_mesh.export(str(path))
+        path = self._export_geometry(mesh_with_voxel)
 
         self._report(progress_cb, 100, "Done")
         return path
@@ -799,8 +869,8 @@ class Trellis2GGUFGenerator(BaseGenerator):
     # Export — geometry only (always available)                           #
     # ------------------------------------------------------------------ #
 
-    def _export_geometry(self, mesh_with_voxel, remesh_resolution: int = 768) -> Path:
-        """Export raw vertices + faces as GLB, no texture."""
+    def _export_geometry(self, mesh_with_voxel) -> Path:
+        """Export raw geometry as GLB without refine/texturing cleanup layers."""
         import trimesh
         import numpy as np
 
@@ -815,111 +885,12 @@ class Trellis2GGUFGenerator(BaseGenerator):
         verts = np.asarray(verts, dtype=np.float32)
         faces = np.asarray(faces, dtype=np.int32)
 
-        # Robust cleanup: same pipeline as textured export (cumesh > manual fallback).
-        # flexible_dual_grid_to_mesh produces ~50% inward-facing quads; cumesh's
-        # unify_face_orientations propagates consistent winding across the manifold,
-        # which is far more reliable than the centroid heuristic for complex shapes.
-        _cumesh_ok = False
-        try:
-            import torch as _torch
-            import cumesh as _cumesh
-            from cumesh import CuMesh
-            _vt = _torch.from_numpy(verts).float().cuda().contiguous()
-            _ft = _torch.from_numpy(faces).int().cuda().contiguous()
-
-            cm = CuMesh()
-            cm.init(_vt, _ft)
-
-            # Holes in the Flexible Dual Grid mesh are structural: a face is only created
-            # when all 4 voxel neighbors of an intersected edge exist in the sparse structure.
-            # Missing boundary voxels = holes that fill_holes cannot reliably fix.
-            #
-            # Solution: narrow-band dual contouring remesh (same as to_glb remesh=True in
-            # o_voxel/postprocess.py). Builds a BVH on the holey mesh, then runs dual
-            # contouring on a narrow band around the surface to reconstruct clean topology.
-            try:
-                if not getattr(self, "_cumesh_remesh_ok", True):
-                    raise RuntimeError("cumesh remesh known-broken — skipping to fallback")
-                # Free pipeline VRAM before remesh — generation leaves tensors in cache
-                _torch.cuda.empty_cache()
-                bvh = _cumesh.cuBVH(_vt, _ft)
-                aabb_min = _vt.min(dim=0).values
-                aabb_max = _vt.max(dim=0).values
-                center = (aabb_min + aabb_max) / 2.0
-                scale = (aabb_max - aabb_min).max().item()
-                resolution = remesh_resolution
-                band = 2 if remesh_resolution >= 768 else 1
-                remesh_scale = (resolution + 3 * band) / resolution * scale
-                cm.init(*_cumesh.remeshing.remesh_narrow_band_dc(
-                    _vt, _ft,
-                    center=center,
-                    scale=remesh_scale,
-                    resolution=resolution,
-                    band=band,
-                    project_back=0.9,
-                    bvh=bvh,
-                ))
-                # No simplification after remesh — uniform triangles don't need it
-                # and simplification on remeshed topology reintroduces artifacts.
-                print("[Trellis2GGUFGenerator] Remesh OK")
-            except Exception as remesh_exc:
-                # Root cause: setup.py's _apply_patches used to overwrite cumesh's
-                # own remeshing.py with trellis2_gguf's patch, which references
-                # hashmap_vox without importing it (NameError). Fixed in setup.py;
-                # reinstalling the extension (Repair) restores cumesh's remeshing.py.
-                print(f"[Trellis2GGUFGenerator] cumesh remesh unavailable ({remesh_exc}), using fallback...")
-                _torch.cuda.empty_cache()
-                # Try pymeshlab for hole-filling — handles structural holes better
-                # than CuMesh.fill_holes for FDG meshes with missing boundary voxels.
-                try:
-                    import pymeshlab as _pml
-                    ms = _pml.MeshSet()
-                    ms.add_mesh(_pml.Mesh(
-                        vertex_matrix=_vt.cpu().numpy().astype(np.float64),
-                        face_matrix=_ft.cpu().numpy(),
-                    ))
-                    ms.meshing_remove_duplicate_faces()
-                    ms.meshing_repair_non_manifold_edges()
-                    ms.meshing_close_holes(maxholesize=100)
-                    _pm = ms.current_mesh()
-                    _vt = _torch.from_numpy(_pm.vertex_matrix().astype(np.float32)).cuda().contiguous()
-                    _ft = _torch.from_numpy(_pm.face_matrix().astype(np.int32)).cuda().contiguous()
-                    print("[Trellis2GGUFGenerator] pymeshlab repair applied")
-                except Exception as pml_exc:
-                    print(f"[Trellis2GGUFGenerator] pymeshlab unavailable ({pml_exc}), using fill_holes")
-                cm = CuMesh()
-                cm.init(_vt, _ft)
-                cm.fill_holes(max_hole_perimeter=3e-2)
-                cm.remove_duplicate_faces()
-                cm.repair_non_manifold_edges()
-                cm.remove_small_connected_components(1e-5)
-                cm.fill_holes(max_hole_perimeter=0.1)
-                cm.repair_non_manifold_edges()
-
-            cm.unify_face_orientations()
-            _vout, _fout = cm.read()
-            verts = _vout.cpu().numpy().astype(np.float32)
-            faces = _fout.cpu().numpy().astype(np.int32)
-            _cumesh_ok = True
-        except Exception as exc:
-            print(f"[Trellis2GGUFGenerator] cumesh cleanup failed ({exc}), using centroid winding fix")
+        if len(faces):
             v0, v1, v2 = verts[faces[:, 0]], verts[faces[:, 1]], verts[faces[:, 2]]
-            face_normals   = np.cross(v1 - v0, v2 - v0)
+            face_normals = np.cross(v1 - v0, v2 - v0)
             face_centroids = (v0 + v1 + v2) / 3.0
-            mesh_center    = verts.mean(axis=0)
-            dot = (face_normals * (face_centroids - mesh_center)).sum(axis=1)
-            inward = dot < 0
-            faces[inward] = faces[inward][:, ::-1]
-
-        if _cumesh_ok:
-            v0 = verts[faces[:, 0]]
-            v1 = verts[faces[:, 1]]
-            v2 = verts[faces[:, 2]]
-            fn = np.cross(v1 - v0, v2 - v0)
-            fc = (v0 + v1 + v2) / 3.0
-            mc = verts.mean(axis=0)
-            dot = (fn * (fc - mc)).sum(axis=1)
-            if np.mean(dot < 0) > 0.5:
+            mesh_center = verts.mean(axis=0)
+            if float(((face_normals * (face_centroids - mesh_center)).sum(axis=1) < 0).mean()) > 0.5:
                 faces = faces[:, ::-1]
 
         # Convert from TRELLIS (Z-up, front at +Y) to GLB/Three.js (Y-up, front at +Z).
@@ -936,14 +907,7 @@ class Trellis2GGUFGenerator(BaseGenerator):
         name = f"{int(time.time())}_{uuid.uuid4().hex[:8]}.glb"
         path = self.outputs_dir / name
 
-        # process=True: removes degenerate (zero-area) and duplicate faces, merges duplicate
-        # vertices at grid boundaries — the main source of small "dot" holes.
         mesh = trimesh.Trimesh(vertices=verts, faces=faces, process=True)
-        # doubleSided=True ensures any face whose normal still points inward is rendered
-        # from both sides, preventing see-through artifacts.
-        mesh.visual = trimesh.visual.TextureVisuals(
-            material=trimesh.visual.material.PBRMaterial(doubleSided=True)
-        )
         mesh.export(str(path))
         return path
 
@@ -952,32 +916,26 @@ class Trellis2GGUFGenerator(BaseGenerator):
     # ------------------------------------------------------------------ #
 
     def _ensure_comfyui_gguf(self) -> None:
-        """
-        Ensure ComfyUI-GGUF (city96) files are present at the path that trellis2_gguf's
-        _setup_native_gguf() searches.  Without these, GGUF dequant falls back to CPU.
-        """
-        import os, urllib.request
-        from pathlib import Path
+        """Fail fast if setup did not install the GGUF support files."""
+        import platform
 
-        utils_dir = Path(_EXTENSION_DIR) / "venv" / "Lib" / "site-packages" / "trellis2_gguf" / "utils"
-        gguf_dir  = (utils_dir / ".." / ".." / ".." / "ComfyUI-GGUF").resolve()
+        venv_dir = Path(_EXTENSION_DIR) / "venv"
+        if platform.system() == "Windows":
+            utils_dir = venv_dir / "Lib" / "site-packages" / "trellis2_gguf" / "utils"
+        else:
+            lib_dir = venv_dir / "lib"
+            candidates = sorted(lib_dir.glob("python3*/site-packages/trellis2_gguf/utils")) if lib_dir.exists() else []
+            utils_dir = candidates[-1] if candidates else lib_dir / "python3" / "site-packages" / "trellis2_gguf" / "utils"
+        gguf_dir = (utils_dir / ".." / ".." / ".." / "ComfyUI-GGUF").resolve()
 
-        _FILES = ["ops.py", "dequant.py", "loader.py"]
-        if all((gguf_dir / f).exists() for f in _FILES):
-            return
-
-        gguf_dir.mkdir(parents=True, exist_ok=True)
-        base = "https://raw.githubusercontent.com/city96/ComfyUI-GGUF/main/"
-        for fname in _FILES:
-            dest = gguf_dir / fname
-            if dest.exists():
-                continue
-            print(f"[Trellis2] Downloading ComfyUI-GGUF/{fname} …")
-            try:
-                urllib.request.urlretrieve(base + fname, str(dest))
-            except Exception as exc:
-                print(f"[Trellis2] Warning: could not download {fname}: {exc}")
-        print(f"[Trellis2] ComfyUI-GGUF installed at {gguf_dir}")
+        required = ["ops.py", "dequant.py", "loader.py"]
+        missing = [name for name in required if not (gguf_dir / name).exists()]
+        if missing:
+            raise RuntimeError(
+                "Generate Mesh cannot start because ComfyUI-GGUF support files are missing: "
+                + ", ".join(missing)
+                + ". Re-run the extension setup/repair path instead of relying on runtime downloads."
+            )
 
     def _ensure_trellis2_gguf(self) -> None:
         """Assert that trellis2_gguf is importable from the venv (installed by setup.py)."""
@@ -1012,50 +970,63 @@ class Trellis2GGUFGenerator(BaseGenerator):
         _stub("comfy.utils", ProgressBar=_ProgressBar)
         _stub("comfy", utils=sys.modules["comfy.utils"])
 
+        geometry_assets = self._resolve_generate_assets()
+        weights_root = geometry_assets.root
+
+        def _require_relative_path(relative_path: str, *, label: str) -> Path:
+            path = weights_root / relative_path
+            if not path.is_file():
+                raise FileNotFoundError(
+                    f"[Trellis2] Missing canonical {label} at '{relative_path}'."
+                )
+            return path
+
+        def _resolve_model_manager_path(basename, enable_gguf=False, gguf_quant="Q8_0", precision=None):
+            spec = _MODEL_MANAGER_PATHS.get(basename)
+            if spec is None:
+                raise FileNotFoundError(
+                    f"[Trellis2] Cannot resolve model '{basename}' because it is not in the canonical model-manager path map."
+                )
+
+            if enable_gguf:
+                gguf_template = spec.get("gguf")
+                if not gguf_template:
+                    raise FileNotFoundError(
+                        f"[Trellis2] Model '{basename}' has no canonical GGUF path in this clean rebuild."
+                    )
+                model_file = _require_relative_path(
+                    gguf_template.format(gguf_quant=gguf_quant),
+                    label=f"GGUF model '{basename}'",
+                )
+            else:
+                model_file = None
+                tensor_candidates: list[str] = []
+                if precision and spec.get("tensor_precision"):
+                    tensor_candidates.append(spec["tensor_precision"].format(precision=precision))
+                tensor_candidates.append(spec["tensor"])
+                for relative_path in tensor_candidates:
+                    candidate = weights_root / relative_path
+                    if candidate.is_file():
+                        model_file = candidate
+                        break
+                if model_file is None:
+                    raise FileNotFoundError(
+                        f"[Trellis2] Missing canonical tensor model '{basename}' at: "
+                        + ", ".join(tensor_candidates)
+                    )
+
+            config_file = _require_relative_path(spec["config"], label=f"config '{basename}.json'")
+            return str(config_file), str(model_file), bool(enable_gguf)
+
         # trellis2_gguf/models/__init__.py dynamically loads model_manager.py from
         # site-packages (a ComfyUI-specific file).  Pre-inject a stub so the file
         # lookup is skipped entirely.
         if "trellis2_model_manager" not in sys.modules:
-            import glob as _glob
-            import os as _os
-
-            _search_root = models_dir  # e.g. D:\ModlyModels\models
-
-            def _resolve_local_path(basename, enable_gguf=False, gguf_quant="Q8_0", precision=None):
-                if enable_gguf:
-                    pattern = _os.path.join(_search_root, "**", f"{basename}_{gguf_quant}.gguf")
-                    hits = _glob.glob(pattern, recursive=True)
-                    if hits:
-                        model_file  = hits[0]
-                        config_file = model_file.replace(f"_{gguf_quant}.gguf", ".json")
-                        if not _os.path.exists(config_file):
-                            config_file = _os.path.join(_os.path.dirname(model_file), basename + ".json")
-                        return config_file, model_file, True
-                suf     = f"_{precision}" if precision else ""
-                pattern = _os.path.join(_search_root, "**", f"{basename}{suf}.safetensors")
-                hits    = _glob.glob(pattern, recursive=True)
-                matched_suf = suf
-                if not hits:
-                    pattern = _os.path.join(_search_root, "**", f"{basename}.safetensors")
-                    hits    = _glob.glob(pattern, recursive=True)
-                    matched_suf = ""
-                if hits:
-                    model_file  = hits[0]
-                    config_file = model_file.replace(f"{matched_suf}.safetensors", ".json")
-                    if not _os.path.exists(config_file):
-                        config_file = _os.path.join(_os.path.dirname(model_file), basename + ".json")
-                    return config_file, model_file, False
-                raise FileNotFoundError(
-                    f"[Trellis2] Cannot resolve model: {basename} "
-                    f"(gguf={enable_gguf}, quant={gguf_quant}, precision={precision}) "
-                    f"in {_search_root}"
-                )
-
             mm = types.ModuleType("trellis2_model_manager")
-            mm.resolve_local_path  = _resolve_local_path
+            mm.resolve_local_path = _resolve_model_manager_path
             mm.ensure_model_files  = lambda: None
             sys.modules["trellis2_model_manager"] = mm
-            print(f"[Trellis2] Injected trellis2_model_manager stub (search root: {_search_root})")
+            print(f"[Trellis2] Injected trellis2_model_manager stub (search root: {weights_root})")
 
         # huggingface_hub >=0.24 validates repo IDs strictly and rejects
         # Windows absolute paths.  Patch it to allow local paths through.

@@ -1,0 +1,8 @@
+# Local Spec-Driven Development / OpenSpec artifacts.
+openspec/
+.openspec/
+docs/sdd/
+
+# Python generated files.
+__pycache__/
+*.py[cod]

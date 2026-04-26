@@ -1,14 +1,8 @@
-"""
-Trellis.2 GGUF — extension setup script.
+"""Trellis.2 GGUF extension setup script.
 
-Creates an isolated venv and installs all required dependencies:
-  - PyTorch (version selected by GPU SM / CUDA driver)
-  - Custom CUDA wheels from https://pozzettiandrea.github.io/cuda-wheels/
-      cumesh, nvdiffrast, nvdiffrec_render, flex_gemm, o_voxel
-  - triton-windows (Windows only)
-  - Python packages from requirements (gguf, meshlib, rembg, trimesh, …)
-  - trellis2_gguf source package (from ComfyUI-Trellis2-GGUF GitHub)
-  - Patches: flexible_dual_grid.py, remeshing.py
+Creates an isolated venv and installs the geometry-first runtime slice.
+The initial clean rebuild keeps Generate Mesh public and treats texturing /
+refine-only native pieces as optional follow-up work on supported platforms.
 
 Called by Modly at extension install time with:
     python setup.py '{"python_exe":"...","ext_dir":"...","gpu_sm":86,"cuda_version":124}'
@@ -24,13 +18,15 @@ import urllib.request
 import zipfile
 from pathlib import Path
 
+from runtime_support import DependencyPreflight, RuntimeEnvironment
+
 _COMFYUI_TRELLIS2_ZIP = "https://github.com/Aero-Ex/ComfyUI-Trellis2-GGUF/archive/refs/heads/main.zip"
 _WHEELS_INDEX_BASE    = "https://pozzettiandrea.github.io/cuda-wheels/"
 
-# cumesh and flex-gemm are hard dependencies; the others are optional (texture baking)
-# Keys are index URL names (hyphens); values are the pip-installable wheel names
-_CUDA_WHEELS_REQUIRED = ["cumesh", "flex-gemm"]
-_CUDA_WHEELS_OPTIONAL = ["nvdiffrast", "o-voxel"]
+# Geometry-first slice: keep required wheels limited to the generate path.
+# Refine-only wheels stay optional and are never claimed on unsupported tags.
+_CUDA_WHEELS_REQUIRED = ["cumesh", "o-voxel"]
+_CUDA_WHEELS_OPTIONAL = ["flex-gemm", "nvdiffrast"]
 _CUDA_WHEELS = _CUDA_WHEELS_REQUIRED + _CUDA_WHEELS_OPTIONAL
 
 # Standard Python packages
@@ -93,6 +89,119 @@ def _get_torch_version(venv: Path) -> str:
         return ""
 
 
+def _python_tag() -> str:
+    return f"cp{sys.version_info.major}{sys.version_info.minor}"
+
+
+def _wheel_platform_tag(system: str | None = None, machine: str | None = None) -> str | None:
+    system_name = (system or platform.system()).lower()
+    machine_name = (machine or platform.machine()).lower()
+
+    if system_name == "windows" and machine_name in {"amd64", "x86_64"}:
+        return "win_amd64"
+    if system_name == "linux" and machine_name in {"amd64", "x86_64"}:
+        return "linux_x86_64"
+    return None
+
+
+def _setup_runtime_environment(
+    gpu_sm: int,
+    cuda_version: int = 0,
+    *,
+    system: str | None = None,
+    machine: str | None = None,
+) -> RuntimeEnvironment:
+    system_name = system or platform.system()
+    machine_name = machine or platform.machine()
+
+    return RuntimeEnvironment(
+        system=system_name,
+        machine=machine_name,
+        python_tag=_python_tag(),
+        python_version=platform.python_version(),
+        torch_version="",
+        cuda_version=str(cuda_version) if cuda_version else "",
+        gpu_sm=str(gpu_sm),
+        asset_groups={"generate": True, "refine": True},
+        refine_lab_verified=False,
+    )
+
+
+def _native_policy_report(env: RuntimeEnvironment) -> dict[str, object]:
+    platform_tag = _wheel_platform_tag(env.system, env.machine)
+    machine_name = env.machine.lower()
+    known_dependencies = {
+        name: {"state": "unknown", "detail": "setup has not installed this dependency yet"}
+        for name in ("flex_gemm", "cumesh", "nvdiffrast", "o_voxel", "spconv", "cumm")
+    }
+
+    if env.system.lower() == "linux" and machine_name in {"aarch64", "arm64"}:
+        detail = "public custom CUDA wheel index does not publish Linux ARM64 tags; source builds are out of scope for this repo"
+        known_dependencies = {
+            "flex_gemm": {"state": "unsupported", "detail": detail},
+            "cumesh": {"state": "unsupported", "detail": detail},
+            "nvdiffrast": {"state": "unsupported", "detail": detail},
+            "o_voxel": {"state": "unsupported", "detail": detail},
+            "spconv": {"state": "unsupported", "detail": "setup.py does not build spconv from source in this repo"},
+            "cumm": {"state": "unsupported", "detail": "setup.py does not build cumm from source in this repo"},
+        }
+
+    evaluated_env = RuntimeEnvironment(
+        system=env.system,
+        machine=env.machine,
+        python_tag=env.python_tag,
+        python_version=env.python_version,
+        torch_version=env.torch_version,
+        cuda_version=env.cuda_version,
+        gpu_sm=env.gpu_sm,
+        asset_groups=env.asset_groups,
+        refine_lab_verified=env.refine_lab_verified,
+        known_dependencies=known_dependencies,
+    )
+    return {
+        "env": evaluated_env,
+        "platform_tag": platform_tag,
+        "generate": DependencyPreflight.evaluate("generate", evaluated_env),
+        "refine": DependencyPreflight.evaluate("refine", evaluated_env),
+    }
+
+
+def _preflight_setup_policy(gpu_sm: int, cuda_version: int = 0) -> dict[str, object]:
+    report = _native_policy_report(_setup_runtime_environment(gpu_sm, cuda_version))
+    env = report["env"]
+    assert isinstance(env, RuntimeEnvironment)
+
+    print(
+        "[setup] Native policy context: "
+        f"system={env.system} machine={env.machine} python={env.python_tag} "
+        f"cuda={env.cuda_version or 'unknown'} gpu_sm={env.gpu_sm or 'unknown'}"
+    )
+
+    if env.system.lower() == "linux" and env.machine.lower() in {"aarch64", "arm64"}:
+        generate = report["generate"]
+        refine = report["refine"]
+        assert hasattr(generate, "blockers") and hasattr(refine, "blockers")
+        raise RuntimeError(
+            "[setup] Linux ARM64 is not supported by the public native-wheel path for this clean rebuild.\n"
+            f"[setup] Generate blockers: {'; '.join(generate.blockers)}\n"
+            f"[setup] Refine blockers: {'; '.join(refine.blockers)}\n"
+            "[setup] This setup will not pretend linux_x86_64 wheels apply to ARM64, and it will not build native dependencies from source."
+        )
+
+    if report["platform_tag"] is None:
+        raise RuntimeError(
+            f"[setup] Unsupported platform for native wheels: {env.system}/{env.machine}. "
+            "Only Windows x86_64 and Linux x86_64 are modeled in this setup script."
+        )
+
+    refine = report["refine"]
+    assert hasattr(refine, "blockers")
+    if refine.blockers:
+        print(f"[setup] NOTE: Refine remains gated in this slice: {'; '.join(refine.blockers)}")
+
+    return report
+
+
 # --------------------------------------------------------------------------- #
 # Custom CUDA wheels (pozzettiandrea.github.io)                                #
 # --------------------------------------------------------------------------- #
@@ -150,11 +259,14 @@ def _find_wheel_url(lib_name: str, python_tag: str, platform_tag: str, torch_ver
     return None
 
 
-def _install_cuda_wheels(venv: Path, gpu_sm: int) -> None:
+def _install_cuda_wheels(venv: Path, gpu_sm: int, platform_tag: str) -> None:
     """Download and install custom CUDA wheels from pozzettiandrea.github.io."""
-    is_win = platform.system() == "Windows"
-    python_tag   = f"cp{sys.version_info.major}{sys.version_info.minor}"
-    platform_tag = "win_amd64" if is_win else "linux_x86_64"
+    if platform_tag not in {"win_amd64", "linux_x86_64"}:
+        raise RuntimeError(
+            f"[setup] Refusing unsupported CUDA wheel platform tag '{platform_tag}'. "
+            "This script only knows how to query win_amd64 and linux_x86_64 wheels."
+        )
+    python_tag = _python_tag()
     torch_ver    = _get_torch_version(venv)
 
     print(f"[setup] Installing CUDA wheels (python={python_tag}, platform={platform_tag}, torch={torch_ver}) …")
@@ -227,12 +339,8 @@ def _install_triton_windows(venv: Path, torch_ver: str, gpu_sm: int = 0) -> None
 
 def _install_trellis2_gguf(venv: Path) -> None:
     """
-    Download ComfyUI-Trellis2-GGUF from GitHub and extract:
-      - trellis2_gguf/   -> site-packages/trellis2_gguf/
-      - patch/           -> site-packages/trellis2_gguf_patch/
-
-    Also applies the patches to the corresponding installed packages
-    (flexible_dual_grid.py in spconv, remeshing.py in trellis2_gguf).
+    Download ComfyUI-Trellis2-GGUF from GitHub and extract only the
+    trellis2_gguf package into site-packages.
     """
     sp    = _site_packages(venv)
     dest  = sp / "trellis2_gguf"
@@ -250,8 +358,6 @@ def _install_trellis2_gguf(venv: Path) -> None:
 
     zip_root = "ComfyUI-Trellis2-GGUF-main/"
     pkg_prefix   = f"{zip_root}trellis2_gguf/"
-    patch_prefix = f"{zip_root}patch/"
-
     with zipfile.ZipFile(io.BytesIO(data)) as zf:
         # ── trellis2_gguf package ──────────────────────────────────────── #
         for member in zf.namelist():
@@ -265,22 +371,7 @@ def _install_trellis2_gguf(venv: Path) -> None:
                 target.parent.mkdir(parents=True, exist_ok=True)
                 target.write_bytes(zf.read(member))
 
-        # ── patch files ────────────────────────────────────────────────── #
-        patch_dest = sp / "trellis2_gguf_patch"
-        for member in zf.namelist():
-            if not member.startswith(patch_prefix):
-                continue
-            rel    = member[len(patch_prefix):]       # e.g. "flexible_dual_grid.py"
-            if not rel or member.endswith("/"):
-                continue
-            target = patch_dest / rel
-            target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_bytes(zf.read(member))
-
     print(f"[setup] trellis2_gguf installed to {sp}.")
-
-    # ── Apply patches ──────────────────────────────────────────────────── #
-    _apply_patches(sp, patch_dest)
 
 
 def _install_comfyui_gguf(venv: Path) -> None:
@@ -313,45 +404,15 @@ def _install_comfyui_gguf(venv: Path) -> None:
             print(f"[setup] WARNING: could not download ComfyUI-GGUF/{fname}: {exc}")
     print("[setup] ComfyUI-GGUF installed.")
 
-
-def _apply_patches(sp: Path, patch_dir: Path) -> None:
-    """
-    Replace specific files in installed packages with the patched versions.
-
-    Known patches:
-      flexible_dual_grid.py -> overwrites the same file inside spconv/modules/
-      remeshing.py          -> overwrites the same file inside trellis2_gguf/
-    """
-    if not patch_dir.exists():
-        return
-
-    patch_map = {
-        "flexible_dual_grid.py": _find_in_site(sp, "flexible_dual_grid.py"),
-        "remeshing.py":          _find_in_site(sp, "remeshing.py"),
-    }
-
-    for patch_name, targets in patch_map.items():
-        src = patch_dir / patch_name
-        if not src.exists():
-            continue
-        for tgt in targets:
-            try:
-                tgt.write_bytes(src.read_bytes())
-                print(f"[setup] Patched {tgt.relative_to(sp)}")
-            except Exception as exc:
-                print(f"[setup] WARNING: Could not patch {tgt}: {exc}")
-
-
-def _find_in_site(sp: Path, filename: str) -> list[Path]:
-    """Return all occurrences of filename under site-packages."""
-    return list(sp.rglob(filename))
-
-
 # --------------------------------------------------------------------------- #
 # Main setup                                                                   #
 # --------------------------------------------------------------------------- #
 
 def setup(python_exe: str, ext_dir: Path, gpu_sm: int, cuda_version: int = 0) -> None:
+    policy = _preflight_setup_policy(gpu_sm, cuda_version)
+    platform_tag = policy["platform_tag"]
+    assert isinstance(platform_tag, str)
+
     venv = ext_dir / "venv"
 
     print(f"[setup] Creating venv at {venv} …")
@@ -389,7 +450,7 @@ def setup(python_exe: str, ext_dir: Path, gpu_sm: int, cuda_version: int = 0) ->
         _pip(venv, "install", "rembg", "onnxruntime")
 
     # ── Custom CUDA wheels (cumesh, nvdiffrast, flex_gemm, …) ─────────── #
-    _install_cuda_wheels(venv, gpu_sm)
+    _install_cuda_wheels(venv, gpu_sm, platform_tag)
 
     # ── triton-windows ────────────────────────────────────────────────── #
     torch_ver = _get_torch_version(venv)

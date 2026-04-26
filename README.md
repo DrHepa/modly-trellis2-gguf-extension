@@ -1,56 +1,53 @@
 # Trellis.2 GGUF — Modly Extension
 
-Convert a single image into a 3D mesh in one pass, using the [Trellis.2 GGUF](https://huggingface.co/Aero-Ex/Trellis2-GGUF) model by Aero-Ex.
+This clean rebuild currently supports **Generate Mesh only** from the [Aero-Ex/Trellis2-GGUF](https://huggingface.co/Aero-Ex/Trellis2-GGUF) Hugging Face repo.
 
----
+## Current scope
 
-## Basic workflow
+- Public runtime scope: **Generate Mesh** only
+- `Texture Mesh` / refine is **intentionally not exposed** in this clean slice
+- Linux ARM64 refine/texturing remains **blocked** pending external native dependency lab evidence
+- No production `grid_sample_3d` fallback is shipped in this rebuild
+- Hugging Face asset resolution is **deterministic** and uses explicit expected paths only; there is no broad recursive first-hit lookup
 
-![Default workflow — image to mesh to textured mesh](docs/default-workflow.png)
+## Generate Mesh
 
-The workflow above is the recommended starting point. It chains the two nodes back-to-back:
-
-![Example output — generated mesh with texture](docs/generated.png)
-
-1. **Generate Mesh** — takes an image and produces a geometry-only GLB
-2. **Texture Mesh** — takes the same image and the generated mesh, and bakes textures onto it
-
----
-
-## Nodes
-
-### Generate Mesh
+`Generate Mesh` converts one image into a geometry-only GLB.
 
 | Parameter | Description | Default |
 |---|---|---|
-| `image` | Input image (any background — it will be removed) | — |
+| `image` | Input image | — |
 | `pipeline` | Quality preset: `fast` (512), `balanced` (1024), `high` (1024 cascade), `ultra` (1536 cascade) | `balanced` |
-| `quantization` | GGUF quant level (Q4_K_M → Q8_0). Lower = less VRAM, less quality | `Q5_K_M` |
+| `quantization` | GGUF quant level (Q4_K_M → Q8_0) | `Q5_K_M` |
 | `ss_steps` | Sparse-structure diffusion steps | `25` |
 | `slat_steps` | Shape SLaT diffusion steps | `25` |
-| `foreground_ratio` | How much of the frame the subject should fill (0–1) | `0.85` |
-| `remesh_resolution` | Dual-contouring grid resolution for the output mesh | `256` |
-| `seed` | Reproducibility seed | `0` |
+| `foreground_ratio` | Subject fill ratio (0–1) | `0.85` |
+| `seed` | Reproducibility seed (`-1` = random) | `-1` |
 
-**Output:** geometry GLB (no texture)
+**Output:** geometry-only GLB
 
-### Texture Mesh
+## Why Texture Mesh is deferred
 
-| Parameter | Description | Default |
-|---|---|---|
-| `image` | Same input image used for generation | — |
-| `mesh` | GLB mesh to texture (from Generate Mesh) | — |
-| `texture_resolution` | Texture map size in pixels | `1024` |
-| `atlas_size` | UV atlas packing resolution | `2048` |
-| `texture_steps` | Texture diffusion steps | `12` |
-| `guidance_strength` | CFG guidance for texture diffusion | `3.0` |
-| `foreground_ratio` | Should match the value used in Generate Mesh | `0.85` |
-| `seed` | Reproducibility seed | `0` |
+Texturing/refine is deferred on purpose. This rebuild does not claim production support for the native dependency stack required by the texture path, especially on Linux ARM64. Refine stays hidden until external evidence exists for the dependency matrix and until the texturing path is reintroduced behind explicit acceptance gates.
 
-**Output:** textured GLB
+See `docs/dependency-lab.md` for the public dependency-lab expectations.
 
----
+## Deferred work
+
+- `RefineAdapter` wired to `Trellis2TexturingPipeline`
+- `tex_slat_flow_model.forward` cond-sensitivity acceptance gate
+- External Linux ARM64 dependency lab execution and evidence review
+- Future geometry export cleanup, if follow-up validation shows it is needed
+
+## Contributor validation
+
+Run these lightweight checks before review:
+
+- `PYTHONDONTWRITEBYTECODE=1 python3 -B -m py_compile runtime_support.py validate_clean_hf_runtime_support.py setup.py generator.py validate_clean_hf_rebuild.py`
+- `PYTHONDONTWRITEBYTECODE=1 python3 validate_clean_hf_runtime_support.py`
+- `PYTHONDONTWRITEBYTECODE=1 python3 validate_clean_hf_rebuild.py`
+- `python3 -m json.tool manifest.json >/dev/null`
 
 ## Model source
 
-Weights: [Aero-Ex/Trellis2-GGUF](https://huggingface.co/Aero-Ex/Trellis2-GGUF) on HuggingFace
+Weights: [Aero-Ex/Trellis2-GGUF](https://huggingface.co/Aero-Ex/Trellis2-GGUF) on Hugging Face.
