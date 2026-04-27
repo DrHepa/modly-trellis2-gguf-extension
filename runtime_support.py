@@ -5,7 +5,7 @@ import re
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from fnmatch import fnmatchcase
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from typing import Any, Literal
 
 
@@ -59,6 +59,7 @@ class WheelCandidate:
     python_tag: str
     platform_tag: str
     version: str = ""
+    build_tag: str = ""
     torch_tag: str = ""
     cuda_tag: str = ""
     url: str = ""
@@ -138,8 +139,14 @@ COMFYUI_GGUF_REQUIRED_FILES: tuple[str, ...] = ("ops.py", "dequant.py", "loader.
 _DEFAULT_PUBLIC_WHEEL_INDEX = "https://pozzettiandrea.github.io/cuda-wheels/"
 
 
-def comfyui_gguf_target_dir(site_packages: str | Path) -> Path:
-    return Path(site_packages).resolve().parent / "ComfyUI-GGUF"
+def comfyui_gguf_target_dir(site_packages: str | Path) -> Path | PureWindowsPath:
+    if isinstance(site_packages, Path):
+        return site_packages.parent / "ComfyUI-GGUF"
+
+    raw = str(site_packages)
+    if _looks_like_windows_path(raw):
+        return PureWindowsPath(raw).parent / "ComfyUI-GGUF"
+    return Path(raw).parent / "ComfyUI-GGUF"
 
 
 def comfyui_gguf_missing_files(target_dir: str | Path) -> tuple[str, ...]:
@@ -264,7 +271,8 @@ def parse_wheel_candidate(filename: str, source: WheelSource, requirement: str |
 
     stem = wheel_name[:-4]
     match = re.match(
-        r"^(?P<distribution>.+)-(?P<version>\d[^-]*?(?:[-_.][^-]+)*)-(?P<python_tag>[^-]+)-(?P<abi_tag>[^-]+)-(?P<platform_tag>[^-]+)$",
+        r"^(?P<distribution>.+?)-(?P<version>\d[^-]*?(?:[+_.][^-]+)*)"
+        r"(?:-(?P<build_tag>\d[^-]*))?-(?P<python_tag>[^-]+)-(?P<abi_tag>[^-]+)-(?P<platform_tag>[^-]+)$",
         stem,
     )
     if not match:
@@ -272,6 +280,7 @@ def parse_wheel_candidate(filename: str, source: WheelSource, requirement: str |
 
     distribution = match.group("distribution")
     version = match.group("version")
+    build_tag = match.group("build_tag") or ""
     python_tag = match.group("python_tag")
     platform_tag = match.group("platform_tag")
 
@@ -288,6 +297,7 @@ def parse_wheel_candidate(filename: str, source: WheelSource, requirement: str |
         python_tag=python_tag,
         platform_tag=platform_tag,
         version=version,
+        build_tag=build_tag,
         torch_tag=torch_match.group("tag") if torch_match else "",
         cuda_tag=cuda_match.group("tag") if cuda_match else "",
         url=url,
@@ -333,7 +343,11 @@ def resolve_wheel_candidate(
                 rejection_notes.append(f"{candidate.filename}: {reason}")
 
         if compatible:
-            chosen = sorted(compatible, key=lambda candidate: candidate.filename)[0]
+            chosen = sorted(
+                compatible,
+                key=lambda candidate: _wheel_candidate_rank_key(candidate, env),
+                reverse=True,
+            )[0]
             return WheelResolutionResult(
                 requirement=canonical_requirement,
                 state="resolved",
@@ -403,6 +417,123 @@ def _distribution_matches_requirement(
         elif normalized_distribution == normalized_alias:
             return True
     return False
+
+
+def _looks_like_windows_path(value: str) -> bool:
+    normalized = str(value or "").strip()
+    return bool(re.match(r"^[a-zA-Z]:[\\/]", normalized) or "\\" in normalized)
+
+
+def _wheel_candidate_rank_key(candidate: WheelCandidate, env: RuntimeEnvironment) -> tuple[object, ...]:
+    exact_python = 1 if candidate.python_tag.strip().lower() == env.python_tag.strip().lower() else 0
+    explicit_accel_matches = sum(
+        1
+        for tag, host, kind in (
+            (candidate.torch_tag, env.torch_version, "torch"),
+            (candidate.cuda_tag, env.cuda_version, "cuda"),
+        )
+        if tag and host and _encoded_tag_matches(tag, host, kind=kind)
+    )
+    return (
+        exact_python,
+        explicit_accel_matches,
+        _version_rank_key(candidate.version),
+        _build_rank_key(candidate.build_tag),
+        tuple(-ord(char) for char in candidate.filename),
+    )
+
+
+def _version_rank_key(version: str) -> tuple[tuple[int, object], ...]:
+    return _pep440ish_version_rank_key(version)
+
+
+def _build_rank_key(build_tag: str) -> tuple[tuple[int, object], ...]:
+    return _tokenize_rank_value(build_tag)
+
+
+def _pep440ish_version_rank_key(version: str) -> tuple[tuple[int, object], ...]:
+    normalized = str(version or "").strip().lower()
+    if not normalized:
+        return ()
+
+    public, _, local = normalized.partition("+")
+    release, qualifiers = _split_version_release_and_qualifiers(public)
+    stage_rank, stage_number, post_number = _extract_version_qualifier_rank(qualifiers)
+
+    return (
+        (1, release),
+        (1, stage_rank),
+        (1, stage_number),
+        (1, post_number),
+        (1, _tokenize_rank_value(local)),
+    )
+
+
+def _split_version_release_and_qualifiers(version: str) -> tuple[tuple[int, ...], tuple[str, ...]]:
+    match = re.match(r"^v?(?P<release>\d+(?:[._-]\d+)*)(?P<qualifiers>.*)$", version)
+    if not match:
+        return ((), tuple(re.findall(r"\d+|[a-z]+", version)))
+
+    release_text = match.group("release")
+    qualifiers_text = match.group("qualifiers")
+    release = tuple(int(part) for part in re.split(r"[._-]", release_text) if part != "")
+    while len(release) > 1 and release[-1] == 0:
+        release = release[:-1]
+    return (release, tuple(re.findall(r"\d+|[a-z]+", qualifiers_text)))
+
+
+def _extract_version_qualifier_rank(qualifiers: tuple[str, ...]) -> tuple[int, int, int]:
+    stage_aliases = {
+        "dev": 0,
+        "a": 1,
+        "alpha": 1,
+        "b": 2,
+        "beta": 2,
+        "c": 3,
+        "rc": 3,
+        "pre": 3,
+        "preview": 3,
+    }
+
+    stage_rank = 4
+    stage_number = 0
+    post_number = 0
+
+    for index, token in enumerate(qualifiers):
+        if token == "post":
+            post_number = _qualifier_number_at(qualifiers, index + 1)
+            continue
+
+        mapped_stage = stage_aliases.get(token)
+        if mapped_stage is not None and stage_rank == 4:
+            stage_rank = mapped_stage
+            stage_number = _qualifier_number_at(qualifiers, index + 1)
+
+    if post_number:
+        stage_rank = 5
+
+    return (stage_rank, stage_number, post_number)
+
+
+def _qualifier_number_at(tokens: tuple[str, ...], index: int) -> int:
+    if 0 <= index < len(tokens) and tokens[index].isdigit():
+        return int(tokens[index])
+    return 0
+
+
+def _tokenize_rank_value(value: str) -> tuple[tuple[int, object], ...]:
+    normalized = str(value or "").strip().lower()
+    if not normalized:
+        return ()
+
+    tokens = re.findall(r"\d+|[a-z]+", normalized)
+    ranked: list[tuple[int, object]] = []
+    for token in tokens:
+        if token.isdigit():
+            ranked.append((1, int(token)))
+        else:
+            ranked.append((0, token))
+    return tuple(ranked)
 
 
 def _python_tag_matches(candidate_python_tag: str, host_python_tag: str) -> bool:
