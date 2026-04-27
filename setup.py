@@ -57,7 +57,6 @@ _PY_PACKAGES = [
     "opencv-python-headless",
     "gguf",
     "sdnq",
-    "open3d",
     "rectpack",
     "requests",
     "huggingface_hub",
@@ -65,6 +64,10 @@ _PY_PACKAGES = [
     "accelerate",
     "einops",
     "easydict",
+]
+
+_PY_OPTIONAL_PACKAGES = [
+    "open3d",
 ]
 
 _SETUP_REPORT_FILENAME = "setup-report.json"
@@ -125,6 +128,67 @@ def _get_torch_version(venv: Path) -> str:
 
 def _python_tag() -> str:
     return f"cp{sys.version_info.major}{sys.version_info.minor}"
+
+
+def _is_linux_arm64(system: str | None = None, machine: str | None = None) -> bool:
+    return (system or platform.system()).lower() == "linux" and (machine or platform.machine()).lower() in {"aarch64", "arm64"}
+
+
+def _optional_python_package_policy(
+    package: str,
+    *,
+    system: str | None = None,
+    machine: str | None = None,
+) -> dict[str, str]:
+    if package == "open3d" and _is_linux_arm64(system, machine):
+        return {
+            "name": package,
+            "action": "skip",
+            "status": "skipped",
+            "detail": "skipped on Linux ARM64/aarch64 because no compatible open3d wheel is expected for this setup path",
+        }
+    return {
+        "name": package,
+        "action": "install",
+        "status": "pending",
+        "detail": "optional package will be installed best-effort",
+    }
+
+
+def _install_optional_python_packages(
+    context: SetupContext,
+    *,
+    pip_runner=_pip,
+) -> list[dict[str, str]]:
+    results: list[dict[str, str]] = []
+
+    for package in _PY_OPTIONAL_PACKAGES:
+        policy = _optional_python_package_policy(package, system=context.system, machine=context.machine)
+        result = {
+            "name": package,
+            "status": policy["status"],
+            "detail": policy["detail"],
+        }
+
+        if policy["action"] == "skip":
+            print(f"[setup] NOTE: optional Python dependency {package} skipped. {policy['detail']}")
+            results.append(result)
+            continue
+
+        print(f"[setup] Installing optional Python dependency {package} …")
+        try:
+            pip_runner(context.venv_dir, "install", package)
+            result["status"] = "installed"
+            result["detail"] = "installed successfully"
+            print(f"[setup] Optional Python dependency {package} installed.")
+        except subprocess.CalledProcessError as exc:
+            result["status"] = "failed"
+            result["detail"] = f"install failed: {exc}"
+            print(f"[setup] WARNING: optional Python dependency {package} failed to install ({exc}).")
+
+        results.append(result)
+
+    return results
 
 
 def _redact_url(value: str) -> str:
@@ -728,6 +792,8 @@ def _phase1_install_base(context: SetupContext) -> dict[str, object]:
     print("[setup] Installing core Python dependencies …")
     _pip(context.venv_dir, "install", *_PY_PACKAGES)
 
+    optional_python_packages = _install_optional_python_packages(context)
+
     print("[setup] Installing rembg …")
     if context.gpu_sm >= 70:
         _pip(context.venv_dir, "install", "rembg[gpu]")
@@ -747,6 +813,7 @@ def _phase1_install_base(context: SetupContext) -> dict[str, object]:
         "torch_index": _redact_url(torch_index),
         "torch_version": torch_ver,
         "core_packages": list(_PY_PACKAGES),
+        "optional_packages": optional_python_packages,
         "rembg": "rembg[gpu]" if context.gpu_sm >= 70 else "rembg + onnxruntime",
     }
 
@@ -989,6 +1056,7 @@ def setup_with_config(
             "torch_version": torch_version,
             "torch_index": base_phase["torch_index"],
         },
+        "base_install": base_phase,
         "wheel_sources": _serialize_wheel_sources(context.wheel_sources),
         "dependencies": dependency_results,
         "capabilities": {
