@@ -179,5 +179,106 @@ class RembgPolicyTests(unittest.TestCase):
         self.assertEqual(policy["summary"], "rembg + onnxruntime")
 
 
+class GenerateNativeWheelReportingTests(unittest.TestCase):
+    def test_default_generate_required_native_wheels_include_all_import_time_blockers(self):
+        self.assertEqual(
+            setup_module._CUDA_WHEELS_REQUIRED,
+            ["cumesh", "o-voxel", "flex-gemm", "nvdiffrast"],
+        )
+
+    def test_next_actions_request_all_default_generate_native_wheels(self):
+        context = setup_module._build_setup_context(
+            python_exe=sys.executable,
+            ext_dir=Path("/tmp/modly-trellis2-tests"),
+            gpu_sm=121,
+            cuda_version=128,
+            system="Linux",
+            machine="aarch64",
+        )
+        dependency_results = {
+            "cumesh": {"status": "missing", "detail": "missing"},
+            "o_voxel": {"status": "missing", "detail": "missing"},
+            "flex_gemm": {"status": "missing", "detail": "missing"},
+            "nvdiffrast": {"status": "missing", "detail": "missing"},
+            "spconv": {"status": "unsupported", "detail": "conditional alternate backend"},
+            "cumm": {"status": "unsupported", "detail": "conditional alternate backend"},
+            "comfyui_gguf_support_files": {"status": "installed", "detail": "ok"},
+        }
+        final_env = setup_module._build_final_runtime_environment(context, dependency_results, "2.7.0")
+        generate_report = setup_module.DependencyPreflight.evaluate("generate", final_env)
+        refine_report = setup_module.DependencyPreflight.evaluate("refine", final_env)
+
+        actions = setup_module._build_next_actions(context, dependency_results, generate_report, refine_report)
+        joined = "\n".join(actions)
+
+        self.assertIn("cumesh", joined)
+        self.assertIn("o-voxel", joined)
+        self.assertIn("flex-gemm", joined)
+        self.assertIn("nvdiffrast", joined)
+        self.assertNotIn("spconv", joined)
+        self.assertNotIn("cumm", joined)
+
+    def test_plan_report_labels_phase0_notes_separately(self):
+        report = setup_module._plan_setup(
+            python_exe=sys.executable,
+            ext_dir=Path("/tmp/modly-trellis2-tests"),
+            gpu_sm=121,
+            cuda_version=128,
+            system="Linux",
+            machine="aarch64",
+        )
+
+        self.assertIn("policy_notes", report)
+        self.assertIn("phase0_policy_notes", report)
+        self.assertTrue(any("Linux ARM64 continues with base install" in note for note in report["policy_notes"]))
+        self.assertFalse(any("comfyui_gguf_support_files: missing" in note for note in report["policy_notes"]))
+        self.assertTrue(any("comfyui_gguf_support_files: missing" in note for note in report["phase0_policy_notes"]))
+
+    def test_final_report_filters_stale_phase0_blockers_from_policy_notes(self):
+        context = setup_module._build_setup_context(
+            python_exe=sys.executable,
+            ext_dir=Path("/tmp/modly-trellis2-tests"),
+            gpu_sm=121,
+            cuda_version=128,
+            system="Linux",
+            machine="aarch64",
+        )
+        policy = {
+            "native_wheel_query_supported": False,
+            "policy_notes": [
+                "Linux ARM64 continues with base install, but public native-wheel queries stay disabled and source builds remain out of scope."
+            ],
+            "phase0_policy_notes": [
+                "Linux ARM64 continues with base install, but public native-wheel queries stay disabled and source builds remain out of scope.",
+                "Generate blockers: comfyui_gguf_support_files: missing",
+            ],
+        }
+        dependency_results = {
+            "cumesh": {"status": "installed", "detail": "installed"},
+            "o_voxel": {"status": "installed", "detail": "installed"},
+            "flex_gemm": {"status": "installed", "detail": "installed"},
+            "nvdiffrast": {"status": "installed", "detail": "installed"},
+            "spconv": {"status": "unsupported", "detail": "conditional alternate backend"},
+            "cumm": {"status": "unsupported", "detail": "conditional alternate backend"},
+            "comfyui_gguf_support_files": {"status": "installed", "detail": "verified required support files"},
+        }
+        base_phase = {
+            "venv": "/tmp/modly-trellis2-tests/venv",
+            "torch_packages": ["torch==2.7.0", "torchvision==0.22.0"],
+            "torch_index": "https://download.pytorch.org/whl/cu128",
+            "torch_version": "2.7.0",
+            "core_packages": [],
+            "optional_packages": [],
+            "rembg": "rembg + onnxruntime",
+            "rembg_plan": {"mode": "cpu", "packages": ["rembg", "onnxruntime"], "summary": "rembg + onnxruntime", "detail": "cpu"},
+        }
+
+        report = setup_module._build_setup_report(context, policy, base_phase, dependency_results, "2.7.0")
+
+        self.assertFalse(any("comfyui_gguf_support_files: missing" in note for note in report["policy_notes"]))
+        self.assertTrue(any("comfyui_gguf_support_files: missing" in note for note in report["phase0_policy_notes"]))
+        self.assertTrue(any("Linux ARM64 continues with base install" in note for note in report["policy_notes"]))
+
+
 if __name__ == "__main__":
     unittest.main()

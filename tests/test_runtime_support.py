@@ -4,6 +4,7 @@ from pathlib import Path, PureWindowsPath
 
 from runtime_support import (
     COMFYUI_GGUF_REQUIRED_FILES,
+    DependencyPreflight,
     RuntimeEnvironment,
     WheelSource,
     build_wheel_candidates,
@@ -214,6 +215,44 @@ class WheelResolutionTests(unittest.TestCase):
 
         self.assertEqual(result.state, "resolved")
         self.assertEqual(result.selected_candidate.filename, "Cumesh-1.0.0-cp312-none-manylinux_2_17_aarch64.whl")
+
+
+class DependencyClassificationTests(unittest.TestCase):
+    def test_generate_defaults_block_on_import_time_native_deps(self):
+        env = RuntimeEnvironment(
+            system="Linux",
+            machine="x86_64",
+            python_tag="cp312",
+            known_dependencies={
+                "cumesh": False,
+                "o_voxel": False,
+                "flex_gemm": False,
+                "nvdiffrast": False,
+                "spconv": False,
+                "cumm": False,
+                "comfyui_gguf_support_files": True,
+            },
+            asset_groups={"generate": True, "refine": False},
+        )
+
+        report = DependencyPreflight.evaluate("generate", env)
+
+        blockers = "\n".join(report.blockers)
+        for name in ("cumesh", "o_voxel", "flex_gemm", "nvdiffrast"):
+            with self.subTest(name=name):
+                self.assertIn(name, blockers)
+        self.assertNotIn("spconv", blockers)
+        self.assertNotIn("cumm", blockers)
+
+    def test_generate_definitions_do_not_require_spconv_or_cumm_by_default(self):
+        generate_names = {definition.name for definition in DependencyPreflight.definitions_for("generate")}
+
+        self.assertIn("cumesh", generate_names)
+        self.assertIn("o_voxel", generate_names)
+        self.assertIn("flex_gemm", generate_names)
+        self.assertIn("nvdiffrast", generate_names)
+        self.assertNotIn("spconv", generate_names)
+        self.assertNotIn("cumm", generate_names)
 
 
 if __name__ == "__main__":

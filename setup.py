@@ -40,10 +40,12 @@ from runtime_support import (
 _COMFYUI_TRELLIS2_ZIP = "https://github.com/Aero-Ex/ComfyUI-Trellis2-GGUF/archive/refs/heads/main.zip"
 _WHEELS_INDEX_BASE    = "https://pozzettiandrea.github.io/cuda-wheels/"
 
-# Geometry-first slice: keep required wheels limited to the generate path.
-# Refine-only wheels stay optional and are never claimed on unsupported tags.
-_CUDA_WHEELS_REQUIRED = ["cumesh", "o-voxel"]
-_CUDA_WHEELS_OPTIONAL = ["flex-gemm", "nvdiffrast"]
+# Geometry-first slice: default Generate depends on these native imports today.
+# Alternate sparse backends such as spconv/cumm are reported separately, but
+# they are not treated as default Generate blockers while flex_gemm is the
+# configured sparse backend.
+_CUDA_WHEELS_REQUIRED = ["cumesh", "o-voxel", "flex-gemm", "nvdiffrast"]
+_CUDA_WHEELS_OPTIONAL = []
 _CUDA_WHEELS = _CUDA_WHEELS_REQUIRED + _CUDA_WHEELS_OPTIONAL
 
 # Standard Python packages
@@ -424,19 +426,21 @@ def _preflight_setup_policy(
 
     continue_install_base = True
     native_wheel_query_supported = report["platform_tag"] is not None
-    policy_notes: list[str] = []
+    platform_policy_notes: list[str] = []
+    phase0_policy_notes: list[str] = []
 
     if env.system.lower() == "linux" and env.machine.lower() in {"aarch64", "arm64"}:
         generate = report["generate"]
         refine = report["refine"]
         assert hasattr(generate, "blockers") and hasattr(refine, "blockers")
-        policy_notes.append(
+        platform_policy_notes.append(
             "Linux ARM64 continues with base install, but public native-wheel queries stay disabled and source builds remain out of scope."
         )
-        policy_notes.append(f"Generate blockers: {'; '.join(generate.blockers)}")
-        policy_notes.append(f"Refine blockers: {'; '.join(refine.blockers)}")
+        phase0_policy_notes.extend(platform_policy_notes)
+        phase0_policy_notes.append(f"Generate blockers: {'; '.join(generate.blockers)}")
+        phase0_policy_notes.append(f"Refine blockers: {'; '.join(refine.blockers)}")
     elif report["platform_tag"] is None:
-        policy_notes.append(
+        platform_policy_notes.append(
             f"Unsupported native-wheel host {env.system}/{env.machine}; base install may continue, but native wheel compatibility is unmodeled."
         )
 
@@ -447,7 +451,8 @@ def _preflight_setup_policy(
 
     report["continue_install_base"] = continue_install_base
     report["native_wheel_query_supported"] = native_wheel_query_supported
-    report["policy_notes"] = tuple(policy_notes)
+    report["policy_notes"] = tuple(platform_policy_notes)
+    report["phase0_policy_notes"] = tuple(phase0_policy_notes)
     return report
 
 
@@ -757,6 +762,62 @@ def _build_next_actions(
     return actions
 
 
+def _build_setup_report(
+    context: SetupContext,
+    policy: dict[str, object],
+    base_phase: dict[str, object],
+    dependency_results: dict[str, dict[str, object]],
+    torch_version: str,
+) -> dict[str, object]:
+    final_env = _build_final_runtime_environment(context, dependency_results, torch_version)
+    generate_report = DependencyPreflight.evaluate("generate", final_env)
+    refine_report = DependencyPreflight.evaluate("refine", final_env)
+
+    native_statuses = {result["status"] for result in dependency_results.values()}
+    status = "success"
+    if any(result == "failed" for result in native_statuses):
+        status = "partial"
+    if any(result in {"missing", "skipped", "unsupported"} for result in native_statuses):
+        status = "partial"
+
+    return {
+        "status": status,
+        "phases": {
+            "phase0": "completed",
+            "phase1": "completed",
+            "phase2": "completed",
+            "phase3": "completed",
+        },
+        "platform": {
+            "system": context.system,
+            "machine": context.machine,
+            "platform_tag": context.platform_tag,
+            "native_wheel_query_supported": bool(policy["native_wheel_query_supported"]),
+        },
+        "python": {
+            "tag": context.python_tag,
+            "version": context.python_version,
+            "executable": context.python_exe,
+        },
+        "cuda": {
+            "gpu_sm": str(context.gpu_sm),
+            "cuda_version": str(context.cuda_version) if context.cuda_version else "",
+            "torch_version": torch_version,
+            "torch_index": base_phase["torch_index"],
+        },
+        "base_install": base_phase,
+        "wheel_sources": _serialize_wheel_sources(context.wheel_sources),
+        "dependencies": dependency_results,
+        "capabilities": {
+            "generate": _serialize_capability_report(generate_report),
+            "refine": _serialize_capability_report(refine_report),
+        },
+        "policy_notes": list(policy.get("policy_notes", ())),
+        "phase0_policy_notes": list(policy.get("phase0_policy_notes", ())),
+        "next_actions": _build_next_actions(context, dependency_results, generate_report, refine_report),
+    }
+
+
 def _write_setup_report(ext_dir: Path, report: dict[str, object]) -> Path:
     report_path = ext_dir / _SETUP_REPORT_FILENAME
     report_path.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
@@ -897,6 +958,7 @@ def _plan_setup(
         },
         "wheel_sources": _serialize_wheel_sources(context.wheel_sources),
         "policy_notes": list(policy.get("policy_notes", ())),
+        "phase0_policy_notes": list(policy.get("phase0_policy_notes", ())),
         "venv_dir": str(context.venv_dir),
     }
 
@@ -1052,52 +1114,7 @@ def setup_with_config(
     base_phase = _phase1_install_base(context)
     dependency_results, torch_version = _install_native_wheels(context)
 
-    final_env = _build_final_runtime_environment(context, dependency_results, torch_version)
-    generate_report = DependencyPreflight.evaluate("generate", final_env)
-    refine_report = DependencyPreflight.evaluate("refine", final_env)
-
-    native_statuses = {result["status"] for result in dependency_results.values()}
-    status = "success"
-    if any(result == "failed" for result in native_statuses):
-        status = "partial"
-    if any(result in {"missing", "skipped", "unsupported"} for result in native_statuses):
-        status = "partial"
-
-    report = {
-        "status": status,
-        "phases": {
-            "phase0": "completed",
-            "phase1": "completed",
-            "phase2": "completed",
-            "phase3": "completed",
-        },
-        "platform": {
-            "system": context.system,
-            "machine": context.machine,
-            "platform_tag": context.platform_tag,
-            "native_wheel_query_supported": bool(policy["native_wheel_query_supported"]),
-        },
-        "python": {
-            "tag": context.python_tag,
-            "version": context.python_version,
-            "executable": context.python_exe,
-        },
-        "cuda": {
-            "gpu_sm": str(context.gpu_sm),
-            "cuda_version": str(context.cuda_version) if context.cuda_version else "",
-            "torch_version": torch_version,
-            "torch_index": base_phase["torch_index"],
-        },
-        "base_install": base_phase,
-        "wheel_sources": _serialize_wheel_sources(context.wheel_sources),
-        "dependencies": dependency_results,
-        "capabilities": {
-            "generate": _serialize_capability_report(generate_report),
-            "refine": _serialize_capability_report(refine_report),
-        },
-        "policy_notes": list(policy.get("policy_notes", ())),
-        "next_actions": _build_next_actions(context, dependency_results, generate_report, refine_report),
-    }
+    report = _build_setup_report(context, policy, base_phase, dependency_results, torch_version)
 
     report_path = _write_setup_report(context.ext_dir, report)
     _print_setup_summary(report)
