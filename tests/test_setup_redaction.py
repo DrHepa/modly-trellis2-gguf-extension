@@ -88,7 +88,7 @@ class OptionalPythonDependencyTests(unittest.TestCase):
         context = setup_module._build_setup_context(
             python_exe=sys.executable,
             ext_dir=Path("/tmp/modly-trellis2-tests"),
-            gpu_sm=0,
+            gpu_sm=121,
             system="Linux",
             machine="aarch64",
         )
@@ -97,10 +97,15 @@ class OptionalPythonDependencyTests(unittest.TestCase):
         original_get_torch_version = setup_module._get_torch_version
         original_install_trellis = setup_module._install_trellis2_gguf
         original_install_gguf = setup_module._install_comfyui_gguf
+        pip_calls = []
 
         try:
             setup_module.subprocess.run = lambda *args, **kwargs: None
-            setup_module._pip = lambda *args, **kwargs: None
+
+            def fake_pip(*args, **kwargs):
+                pip_calls.append((args, kwargs))
+
+            setup_module._pip = fake_pip
             setup_module._get_torch_version = lambda _venv: ""
             setup_module._install_trellis2_gguf = lambda _venv: None
             setup_module._install_comfyui_gguf = lambda _venv: None
@@ -116,6 +121,62 @@ class OptionalPythonDependencyTests(unittest.TestCase):
         self.assertIn("optional_packages", base_report)
         self.assertEqual(base_report["optional_packages"][0]["name"], "open3d")
         self.assertEqual(base_report["optional_packages"][0]["status"], "skipped")
+        self.assertEqual(base_report["rembg"], "rembg + onnxruntime")
+        self.assertEqual(base_report["rembg_plan"]["packages"], ["rembg", "onnxruntime"])
+        self.assertEqual(base_report["rembg_plan"]["mode"], "cpu")
+        self.assertIn("Linux ARM64/aarch64", base_report["rembg_plan"]["detail"])
+        self.assertIn(((context.venv_dir, "install", "rembg", "onnxruntime"), {}), pip_calls)
+
+    def test_phase1_propagates_rembg_install_failure(self):
+        context = setup_module._build_setup_context(
+            python_exe=sys.executable,
+            ext_dir=Path("/tmp/modly-trellis2-tests"),
+            gpu_sm=121,
+            system="Linux",
+            machine="aarch64",
+        )
+        original_run = setup_module.subprocess.run
+        original_pip = setup_module._pip
+
+        try:
+            setup_module.subprocess.run = lambda *args, **kwargs: None
+
+            def fake_pip(_venv, *args):
+                if args == ("install", "rembg", "onnxruntime"):
+                    raise subprocess.CalledProcessError(returncode=1, cmd=["pip", *args])
+
+            setup_module._pip = fake_pip
+
+            with self.assertRaises(subprocess.CalledProcessError):
+                setup_module._phase1_install_base(context)
+        finally:
+            setup_module.subprocess.run = original_run
+            setup_module._pip = original_pip
+
+
+class RembgPolicyTests(unittest.TestCase):
+    def test_linux_arm64_high_gpu_uses_cpu_plan(self):
+        policy = setup_module._rembg_package_policy(121, system="Linux", machine="aarch64")
+
+        self.assertEqual(policy["mode"], "cpu")
+        self.assertEqual(policy["packages"], ["rembg", "onnxruntime"])
+        self.assertEqual(policy["summary"], "rembg + onnxruntime")
+        self.assertNotIn("rembg[gpu]", policy["packages"])
+        self.assertIn("Linux ARM64/aarch64", policy["detail"])
+
+    def test_non_arm64_high_gpu_preserves_gpu_plan(self):
+        policy = setup_module._rembg_package_policy(121, system="Linux", machine="x86_64")
+
+        self.assertEqual(policy["mode"], "gpu")
+        self.assertEqual(policy["packages"], ["rembg[gpu]"])
+        self.assertEqual(policy["summary"], "rembg[gpu]")
+
+    def test_low_gpu_uses_cpu_plan(self):
+        policy = setup_module._rembg_package_policy(61, system="Linux", machine="x86_64")
+
+        self.assertEqual(policy["mode"], "cpu")
+        self.assertEqual(policy["packages"], ["rembg", "onnxruntime"])
+        self.assertEqual(policy["summary"], "rembg + onnxruntime")
 
 
 if __name__ == "__main__":

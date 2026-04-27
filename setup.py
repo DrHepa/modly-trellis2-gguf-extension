@@ -155,6 +155,39 @@ def _optional_python_package_policy(
     }
 
 
+def _rembg_package_policy(
+    gpu_sm: int,
+    *,
+    system: str | None = None,
+    machine: str | None = None,
+) -> dict[str, object]:
+    if _is_linux_arm64(system, machine):
+        return {
+            "mode": "cpu",
+            "packages": ["rembg", "onnxruntime"],
+            "summary": "rembg + onnxruntime",
+            "detail": (
+                "Linux ARM64/aarch64 uses CPU-compatible rembg packages; "
+                "rembg[gpu] and onnxruntime-gpu are not selected on this platform"
+            ),
+        }
+
+    if gpu_sm >= 70:
+        return {
+            "mode": "gpu",
+            "packages": ["rembg[gpu]"],
+            "summary": "rembg[gpu]",
+            "detail": "high-GPU platform uses rembg[gpu] existing behavior",
+        }
+
+    return {
+        "mode": "cpu",
+        "packages": ["rembg", "onnxruntime"],
+        "summary": "rembg + onnxruntime",
+        "detail": "low-GPU path uses CPU rembg packages",
+    }
+
+
 def _install_optional_python_packages(
     context: SetupContext,
     *,
@@ -793,12 +826,10 @@ def _phase1_install_base(context: SetupContext) -> dict[str, object]:
     _pip(context.venv_dir, "install", *_PY_PACKAGES)
 
     optional_python_packages = _install_optional_python_packages(context)
+    rembg_policy = _rembg_package_policy(context.gpu_sm, system=context.system, machine=context.machine)
 
-    print("[setup] Installing rembg …")
-    if context.gpu_sm >= 70:
-        _pip(context.venv_dir, "install", "rembg[gpu]")
-    else:
-        _pip(context.venv_dir, "install", "rembg", "onnxruntime")
+    print(f"[setup] Installing rembg … ({rembg_policy['detail']})")
+    _pip(context.venv_dir, "install", *rembg_policy["packages"])
 
     torch_ver = _get_torch_version(context.venv_dir)
     if torch_ver:
@@ -814,7 +845,8 @@ def _phase1_install_base(context: SetupContext) -> dict[str, object]:
         "torch_version": torch_ver,
         "core_packages": list(_PY_PACKAGES),
         "optional_packages": optional_python_packages,
-        "rembg": "rembg[gpu]" if context.gpu_sm >= 70 else "rembg + onnxruntime",
+        "rembg": rembg_policy["summary"],
+        "rembg_plan": rembg_policy,
     }
 
 
