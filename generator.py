@@ -26,7 +26,15 @@ import uuid
 from pathlib import Path
 from typing import Callable, Optional
 
-from runtime_support import AssetResolutionError, DependencyPreflight, HFAssetResolver, RuntimeEnvironment
+from runtime_support import (
+    AssetResolutionError,
+    comfyui_gguf_missing_files,
+    comfyui_gguf_target_dir,
+    DependencyPreflight,
+    HFAssetResolver,
+    RuntimeEnvironment,
+    resolve_dependency_definition,
+)
 from services.generators.base import BaseGenerator, smooth_progress, GenerationCancelled  # noqa: F401
 
 _EXTENSION_DIR = Path(__file__).parent
@@ -197,10 +205,64 @@ class Trellis2GGUFGenerator(BaseGenerator):
 
         return importlib.util.find_spec(module_name) is not None
 
+    def _dependency_probe_value(self, dependency_name: str) -> bool:
+        if dependency_name == "comfyui_gguf_support_files":
+            return self._comfyui_gguf_support_files_available()
+        return self._module_available(dependency_name)
+
+    def _collect_known_dependencies(self) -> dict[str, bool]:
+        return {
+            name: self._dependency_probe_value(name)
+            for name in DependencyPreflight.catalog()
+        }
+
+    def _format_runtime_blockers(self, message: str, blockers: list[str]) -> RuntimeError:
+        return RuntimeError(message + "\n" + "\n".join(f"- {blocker}" for blocker in blockers))
+
+    def _shared_import_error_blockers(self, capability: str, env: RuntimeEnvironment, exc: ImportError) -> list[str]:
+        missing_name = getattr(exc, "name", "") or ""
+        definition = resolve_dependency_definition(missing_name)
+        if definition is None or not definition.is_required_for(capability):
+            return []
+
+        status = DependencyPreflight.classify_dependency(definition.name, env)
+        labels: list[str] = []
+        if definition.is_import_time_for(capability):
+            labels.append("import-time blocker")
+        if definition.is_runtime_critical_for(capability):
+            labels.append("runtime-critical")
+        if status.detail:
+            labels.append(status.detail)
+
+        suffix = f" ({'; '.join(labels)})" if labels else ""
+        return [f"{definition.name}: {status.state}{suffix}"]
+
     def _resolve_generate_assets(self):
         assets = HFAssetResolver.resolve_geometry(self._weights_dir)
         self._geometry_assets = assets
         return assets
+
+    def _comfyui_gguf_support_files_available(self) -> bool:
+        return not self._missing_comfyui_gguf_support_files()
+
+    def _venv_site_packages_dir(self) -> Path:
+        import platform
+
+        venv_dir = Path(_EXTENSION_DIR) / "venv"
+        if platform.system() == "Windows":
+            return venv_dir / "Lib" / "site-packages"
+
+        lib_dir = venv_dir / "lib"
+        candidates = sorted(lib_dir.glob("python3*/site-packages")) if lib_dir.exists() else []
+        if candidates:
+            return candidates[-1]
+        return lib_dir / "python3" / "site-packages"
+
+    def _comfyui_gguf_target_dir(self) -> Path:
+        return comfyui_gguf_target_dir(self._venv_site_packages_dir())
+
+    def _missing_comfyui_gguf_support_files(self) -> tuple[str, ...]:
+        return comfyui_gguf_missing_files(self._comfyui_gguf_target_dir())
 
     def _build_runtime_environment(self, generate_assets_available: bool) -> RuntimeEnvironment:
         import platform
@@ -219,15 +281,6 @@ class Trellis2GGUFGenerator(BaseGenerator):
         except Exception:
             pass
 
-        known_dependencies = {
-            "cumesh": self._module_available("cumesh"),
-            "o_voxel": self._module_available("o_voxel"),
-            "spconv": self._module_available("spconv"),
-            "cumm": self._module_available("cumm"),
-            "nvdiffrast": self._module_available("nvdiffrast"),
-            "flex_gemm": self._module_available("flex_gemm"),
-        }
-
         return RuntimeEnvironment(
             system=platform.system(),
             machine=platform.machine(),
@@ -236,7 +289,7 @@ class Trellis2GGUFGenerator(BaseGenerator):
             torch_version=torch_version,
             cuda_version=cuda_version,
             gpu_sm=gpu_sm,
-            known_dependencies=known_dependencies,
+            known_dependencies=self._collect_known_dependencies(),
             asset_groups={"generate": generate_assets_available, "refine": False},
             refine_lab_verified=False,
         )
@@ -256,10 +309,7 @@ class Trellis2GGUFGenerator(BaseGenerator):
             blockers.append(str(asset_error))
 
         if blockers:
-            raise RuntimeError(
-                "Generate Mesh is unavailable in this runtime environment.\n"
-                + "\n".join(f"- {blocker}" for blocker in blockers)
-            )
+            raise self._format_runtime_blockers("Generate Mesh is unavailable in this runtime environment.", blockers)
 
         if assets is None:
             raise RuntimeError("Generate Mesh assets could not be resolved.")
@@ -917,19 +967,7 @@ class Trellis2GGUFGenerator(BaseGenerator):
 
     def _ensure_comfyui_gguf(self) -> None:
         """Fail fast if setup did not install the GGUF support files."""
-        import platform
-
-        venv_dir = Path(_EXTENSION_DIR) / "venv"
-        if platform.system() == "Windows":
-            utils_dir = venv_dir / "Lib" / "site-packages" / "trellis2_gguf" / "utils"
-        else:
-            lib_dir = venv_dir / "lib"
-            candidates = sorted(lib_dir.glob("python3*/site-packages/trellis2_gguf/utils")) if lib_dir.exists() else []
-            utils_dir = candidates[-1] if candidates else lib_dir / "python3" / "site-packages" / "trellis2_gguf" / "utils"
-        gguf_dir = (utils_dir / ".." / ".." / ".." / "ComfyUI-GGUF").resolve()
-
-        required = ["ops.py", "dequant.py", "loader.py"]
-        missing = [name for name in required if not (gguf_dir / name).exists()]
+        missing = list(self._missing_comfyui_gguf_support_files())
         if missing:
             raise RuntimeError(
                 "Generate Mesh cannot start because ComfyUI-GGUF support files are missing: "
@@ -1045,9 +1083,18 @@ class Trellis2GGUFGenerator(BaseGenerator):
         try:
             from trellis2_gguf.pipelines import Trellis2ImageTo3DPipeline  # noqa
         except ImportError as exc:
+            env = self._build_runtime_environment(generate_assets_available=True)
+            blockers = self._shared_import_error_blockers("generate", env, exc)
+            if blockers:
+                raise self._format_runtime_blockers(
+                    "Generate Mesh is unavailable because the runtime import path is blocked.",
+                    blockers,
+                ) from exc
+
+            missing_name = getattr(exc, "name", "") or "trellis2_gguf"
             raise RuntimeError(
-                "[Trellis2GGUFGenerator] trellis2_gguf not found. "
-                "Click Repair on the Models page to re-run setup.py."
+                "Generate Mesh cannot import the installed runtime package "
+                f"'{missing_name}'. Re-run the extension setup/repair path and review setup-report.json for blockers."
             ) from exc
 
     # ------------------------------------------------------------------ #

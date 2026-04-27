@@ -6,7 +6,7 @@ This clean rebuild currently supports **Generate Mesh only** from the [Aero-Ex/T
 
 - Public runtime scope: **Generate Mesh** only
 - `Texture Mesh` / refine is **intentionally not exposed** in this clean slice
-- Linux ARM64 refine/texturing remains **blocked** pending external native dependency lab evidence
+- Linux ARM64 refine/texturing remains **blocked** until the dependency/runtime gates are satisfied
 - No production `grid_sample_3d` fallback is shipped in this rebuild
 - Hugging Face asset resolution is **deterministic** and uses explicit expected paths only; there is no broad recursive first-hit lookup
 
@@ -26,27 +26,20 @@ This clean rebuild currently supports **Generate Mesh only** from the [Aero-Ex/T
 
 **Output:** geometry-only GLB
 
+## Setup reporting
+
+The setup flow writes `<extension dir>/setup-report.json` and prints the same high-level capability status to stdout.
+
+- `status: success` means setup completed without native dependency failures
+- `status: partial` means base setup completed but one or more native/runtime blockers still remain
+- `capabilities.generate.blockers` and `capabilities.refine.blockers` name the specific missing, unsupported, or import-time blockers
+- On Linux ARM64, base setup may still complete while native CUDA wheels remain unavailable; the report is the setup-verified view of what is still blocked
+
 ## Why Texture Mesh is deferred
 
-Texturing/refine is deferred on purpose. This rebuild does not claim production support for the native dependency stack required by the texture path, especially on Linux ARM64. Refine stays hidden until external evidence exists for the dependency matrix and until the texturing path is reintroduced behind explicit acceptance gates.
+Texturing/refine is deferred on purpose. This rebuild does not claim production support for the native dependency stack required by the texture path, especially on Linux ARM64. Refine stays hidden until the dependency stack is available, runtime blockers are cleared, and the texturing path is reintroduced behind explicit acceptance gates.
 
-See `docs/dependency-lab.md` for the public dependency-lab expectations.
-
-## Deferred work
-
-- `RefineAdapter` wired to `Trellis2TexturingPipeline`
-- `tex_slat_flow_model.forward` cond-sensitivity acceptance gate
-- External Linux ARM64 dependency lab execution and evidence review
-- Future geometry export cleanup, if follow-up validation shows it is needed
-
-## Contributor validation
-
-Run these lightweight checks before review:
-
-- `PYTHONDONTWRITEBYTECODE=1 python3 -B -m py_compile runtime_support.py validate_clean_hf_runtime_support.py setup.py generator.py validate_clean_hf_rebuild.py`
-- `PYTHONDONTWRITEBYTECODE=1 python3 validate_clean_hf_runtime_support.py`
-- `PYTHONDONTWRITEBYTECODE=1 python3 validate_clean_hf_rebuild.py`
-- `python3 -m json.tool manifest.json >/dev/null`
+Texture Mesh stays hidden in the public product surface until all dependency gates, import-time blockers, and runtime acceptance gates pass.
 
 ## Model source
 

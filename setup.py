@@ -10,15 +10,32 @@ Called by Modly at extension install time with:
 
 import io
 import json
+import os
 import platform
 import re
 import subprocess
 import sys
 import urllib.request
 import zipfile
+from dataclasses import dataclass
 from pathlib import Path
+from urllib.parse import urlsplit, urlunsplit
 
-from runtime_support import DependencyPreflight, RuntimeEnvironment
+from runtime_support import (
+    COMFYUI_GGUF_REQUIRED_FILES,
+    DependencyPreflight,
+    KNOWN_DEPENDENCIES,
+    RuntimeEnvironment,
+    WheelCandidate,
+    WheelResolutionResult,
+    WheelSource,
+    build_wheel_sources,
+    comfyui_gguf_support_file_report,
+    comfyui_gguf_target_dir,
+    discover_local_wheel_candidates,
+    parse_wheel_candidate,
+    resolve_wheel_candidate,
+)
 
 _COMFYUI_TRELLIS2_ZIP = "https://github.com/Aero-Ex/ComfyUI-Trellis2-GGUF/archive/refs/heads/main.zip"
 _WHEELS_INDEX_BASE    = "https://pozzettiandrea.github.io/cuda-wheels/"
@@ -50,10 +67,27 @@ _PY_PACKAGES = [
     "easydict",
 ]
 
+_SETUP_REPORT_FILENAME = "setup-report.json"
+
 
 # --------------------------------------------------------------------------- #
 # Helpers                                                                      #
 # --------------------------------------------------------------------------- #
+
+
+@dataclass(frozen=True)
+class SetupContext:
+    python_exe: str
+    ext_dir: Path
+    venv_dir: Path
+    gpu_sm: int
+    cuda_version: int
+    system: str
+    machine: str
+    python_tag: str
+    python_version: str
+    wheel_sources: tuple[WheelSource, ...]
+    platform_tag: str | None
 
 def _pip(venv: Path, *args: str) -> None:
     is_win  = platform.system() == "Windows"
@@ -91,6 +125,113 @@ def _get_torch_version(venv: Path) -> str:
 
 def _python_tag() -> str:
     return f"cp{sys.version_info.major}{sys.version_info.minor}"
+
+
+def _redact_url(value: str) -> str:
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+
+    try:
+        parts = urlsplit(raw)
+    except Exception:
+        return raw
+
+    if not parts.scheme or not parts.netloc:
+        return raw
+
+    host = parts.hostname or ""
+    if parts.port:
+        host = f"{host}:{parts.port}"
+    netloc = host
+    if parts.username or parts.password:
+        netloc = f"***:***@{host}" if host else "***:***"
+    return urlunsplit((parts.scheme, netloc, parts.path, "", ""))
+
+
+def _redact_source_location(source: WheelSource) -> str:
+    if source.kind in {"index", "url", "public-index"}:
+        return _redact_url(source.location)
+    return source.location
+
+
+def _serialize_wheel_sources(sources: tuple[WheelSource, ...]) -> list[dict[str, object]]:
+    return [
+        {
+            "label": source.label,
+            "kind": source.kind,
+            "priority": source.priority,
+            "location": _redact_source_location(source),
+        }
+        for source in sources
+    ]
+
+
+def _serialize_capability_report(report) -> dict[str, object]:
+    return {
+        "state": report.state,
+        "allowed": report.allowed,
+        "blockers": list(report.blockers),
+        "deps": [
+            {"name": dep.name, "state": dep.state, "detail": dep.detail}
+            for dep in report.deps
+        ],
+    }
+
+
+def _select_torch_packages(gpu_sm: int, cuda_version: int) -> tuple[list[str], str, str]:
+    if gpu_sm >= 100 or cuda_version >= 128:
+        return (
+            ["torch==2.7.0", "torchvision==0.22.0"],
+            "https://download.pytorch.org/whl/cu128",
+            f"GPU SM {gpu_sm}, CUDA {cuda_version} -> PyTorch 2.7 + CUDA 12.8 (Blackwell)",
+        )
+    if gpu_sm == 0 or gpu_sm >= 70:
+        return (
+            ["torch==2.6.0", "torchvision==0.21.0"],
+            "https://download.pytorch.org/whl/cu126",
+            f"GPU SM {gpu_sm} -> PyTorch 2.6 + CUDA 12.6",
+        )
+    return (
+        ["torch==2.5.1", "torchvision==0.20.1"],
+        "https://download.pytorch.org/whl/cu118",
+        f"GPU SM {gpu_sm} (legacy) -> PyTorch 2.5 + CUDA 11.8",
+    )
+
+
+def _build_setup_context(
+    python_exe: str,
+    ext_dir: Path,
+    gpu_sm: int,
+    cuda_version: int = 0,
+    *,
+    trellis_wheelhouse: str | None = None,
+    trellis_extra_wheel_index: str | None = None,
+    trellis_extra_wheel_url: str | None = None,
+    system: str | None = None,
+    machine: str | None = None,
+) -> SetupContext:
+    resolved_system = system or platform.system()
+    resolved_machine = machine or platform.machine()
+    wheel_sources = build_wheel_sources(
+        trellis_wheelhouse=trellis_wheelhouse,
+        trellis_extra_wheel_index=trellis_extra_wheel_index,
+        trellis_extra_wheel_url=trellis_extra_wheel_url,
+        public_index_base=_WHEELS_INDEX_BASE,
+    )
+    return SetupContext(
+        python_exe=python_exe,
+        ext_dir=ext_dir,
+        venv_dir=ext_dir / "venv",
+        gpu_sm=gpu_sm,
+        cuda_version=cuda_version,
+        system=resolved_system,
+        machine=resolved_machine,
+        python_tag=_python_tag(),
+        python_version=platform.python_version(),
+        wheel_sources=wheel_sources,
+        platform_tag=_wheel_platform_tag(resolved_system, resolved_machine),
+    )
 
 
 def _wheel_platform_tag(system: str | None = None, machine: str | None = None) -> str | None:
@@ -132,7 +273,7 @@ def _native_policy_report(env: RuntimeEnvironment) -> dict[str, object]:
     machine_name = env.machine.lower()
     known_dependencies = {
         name: {"state": "unknown", "detail": "setup has not installed this dependency yet"}
-        for name in ("flex_gemm", "cumesh", "nvdiffrast", "o_voxel", "spconv", "cumm")
+        for name in KNOWN_DEPENDENCIES
     }
 
     if env.system.lower() == "linux" and machine_name in {"aarch64", "arm64"}:
@@ -144,6 +285,7 @@ def _native_policy_report(env: RuntimeEnvironment) -> dict[str, object]:
             "o_voxel": {"state": "unsupported", "detail": detail},
             "spconv": {"state": "unsupported", "detail": "setup.py does not build spconv from source in this repo"},
             "cumm": {"state": "unsupported", "detail": "setup.py does not build cumm from source in this repo"},
+            "comfyui_gguf_support_files": {"state": "missing", "detail": "setup has not installed ComfyUI-GGUF support files yet"},
         }
 
     evaluated_env = RuntimeEnvironment(
@@ -166,8 +308,14 @@ def _native_policy_report(env: RuntimeEnvironment) -> dict[str, object]:
     }
 
 
-def _preflight_setup_policy(gpu_sm: int, cuda_version: int = 0) -> dict[str, object]:
-    report = _native_policy_report(_setup_runtime_environment(gpu_sm, cuda_version))
+def _preflight_setup_policy(
+    gpu_sm: int,
+    cuda_version: int = 0,
+    *,
+    system: str | None = None,
+    machine: str | None = None,
+) -> dict[str, object]:
+    report = _native_policy_report(_setup_runtime_environment(gpu_sm, cuda_version, system=system, machine=machine))
     env = report["env"]
     assert isinstance(env, RuntimeEnvironment)
 
@@ -177,21 +325,22 @@ def _preflight_setup_policy(gpu_sm: int, cuda_version: int = 0) -> dict[str, obj
         f"cuda={env.cuda_version or 'unknown'} gpu_sm={env.gpu_sm or 'unknown'}"
     )
 
+    continue_install_base = True
+    native_wheel_query_supported = report["platform_tag"] is not None
+    policy_notes: list[str] = []
+
     if env.system.lower() == "linux" and env.machine.lower() in {"aarch64", "arm64"}:
         generate = report["generate"]
         refine = report["refine"]
         assert hasattr(generate, "blockers") and hasattr(refine, "blockers")
-        raise RuntimeError(
-            "[setup] Linux ARM64 is not supported by the public native-wheel path for this clean rebuild.\n"
-            f"[setup] Generate blockers: {'; '.join(generate.blockers)}\n"
-            f"[setup] Refine blockers: {'; '.join(refine.blockers)}\n"
-            "[setup] This setup will not pretend linux_x86_64 wheels apply to ARM64, and it will not build native dependencies from source."
+        policy_notes.append(
+            "Linux ARM64 continues with base install, but public native-wheel queries stay disabled and source builds remain out of scope."
         )
-
-    if report["platform_tag"] is None:
-        raise RuntimeError(
-            f"[setup] Unsupported platform for native wheels: {env.system}/{env.machine}. "
-            "Only Windows x86_64 and Linux x86_64 are modeled in this setup script."
+        policy_notes.append(f"Generate blockers: {'; '.join(generate.blockers)}")
+        policy_notes.append(f"Refine blockers: {'; '.join(refine.blockers)}")
+    elif report["platform_tag"] is None:
+        policy_notes.append(
+            f"Unsupported native-wheel host {env.system}/{env.machine}; base install may continue, but native wheel compatibility is unmodeled."
         )
 
     refine = report["refine"]
@@ -199,6 +348,9 @@ def _preflight_setup_policy(gpu_sm: int, cuda_version: int = 0) -> dict[str, obj
     if refine.blockers:
         print(f"[setup] NOTE: Refine remains gated in this slice: {'; '.join(refine.blockers)}")
 
+    report["continue_install_base"] = continue_install_base
+    report["native_wheel_query_supported"] = native_wheel_query_supported
+    report["policy_notes"] = tuple(policy_notes)
     return report
 
 
@@ -207,92 +359,447 @@ def _preflight_setup_policy(gpu_sm: int, cuda_version: int = 0) -> dict[str, obj
 # --------------------------------------------------------------------------- #
 
 def _find_wheel_url(lib_name: str, python_tag: str, platform_tag: str, torch_ver: str) -> str | None:
-    """
-    Fetch the pozzettiandrea.github.io wheel index for lib_name and return
-    the best matching wheel URL for (python_tag, platform_tag, torch_ver).
+    env = RuntimeEnvironment(
+        system=platform.system(),
+        machine=platform.machine(),
+        python_tag=python_tag,
+        python_version=platform.python_version(),
+        torch_version=torch_ver,
+        cuda_version="",
+        asset_groups={"generate": True, "refine": True},
+    )
+    resolution = _resolve_wheel_candidate(lib_name, env)
+    if resolution.selected_candidate:
+        return resolution.selected_candidate.install_target
+    return None
 
-    Tries the exact torch version first, then falls back to the closest
-    lower version available on the index.
-    Returns None if the index page is unreachable or no match found.
-    """
-    index_url = f"{_WHEELS_INDEX_BASE}{lib_name}/"
+
+def _resolve_wheel_candidate(lib_name: str, env: RuntimeEnvironment) -> WheelResolutionResult:
+    sources = build_wheel_sources(public_index_base=_WHEELS_INDEX_BASE)
+    candidates: list[WheelCandidate] = []
+    for source in sources:
+        candidates.extend(_source_candidates_for_requirement(source, lib_name, env)[0])
+    return resolve_wheel_candidate(lib_name, env, sources, candidates)
+
+
+def _source_candidates_for_requirement(
+    source: WheelSource,
+    lib_name: str,
+    env: RuntimeEnvironment,
+) -> tuple[tuple[WheelCandidate, ...], dict[str, object]]:
+    unsupported_public_host = source.kind == "public-index" and _wheel_platform_tag(env.system, env.machine) is None
+    if unsupported_public_host:
+        return (), {
+            "source": source.label,
+            "kind": source.kind,
+            "status": "skipped",
+            "location": _redact_source_location(source),
+            "detail": f"public query skipped for unsupported host {env.system}/{env.machine}",
+        }
+    if source.kind == "wheelhouse":
+        candidates = discover_local_wheel_candidates(source, requirement=lib_name)
+        return candidates, {
+            "source": source.label,
+            "kind": source.kind,
+            "status": "checked",
+            "location": _redact_source_location(source),
+            "detail": f"discovered {len(candidates)} candidate(s)",
+        }
+    if source.kind in {"index", "public-index"}:
+        candidates = _index_candidates(source, lib_name)
+        return candidates, {
+            "source": source.label,
+            "kind": source.kind,
+            "status": "checked",
+            "location": _redact_source_location(source),
+            "detail": f"resolved {len(candidates)} candidate(s)",
+        }
+    if source.kind == "url":
+        candidates = _url_candidates(source, lib_name)
+        return candidates, {
+            "source": source.label,
+            "kind": source.kind,
+            "status": "checked",
+            "location": _redact_source_location(source),
+            "detail": f"resolved {len(candidates)} candidate(s)",
+        }
+    return (), {
+        "source": source.label,
+        "kind": source.kind,
+        "status": "skipped",
+        "location": _redact_source_location(source),
+        "detail": "source kind is not modeled",
+    }
+
+
+def _index_candidates(source: WheelSource, lib_name: str) -> tuple[WheelCandidate, ...]:
+    index_url = f"{source.location.rstrip('/')}/{lib_name}/"
     try:
         with urllib.request.urlopen(index_url, timeout=30) as resp:
             html = resp.read().decode("utf-8")
     except Exception as exc:
-        print(f"[setup] WARNING: Could not fetch wheel index for {lib_name}: {exc}")
-        return None
+        print(f"[setup] WARNING: Could not fetch wheel index for {lib_name} from {source.label}: {exc}")
+        return ()
 
-    # Extract all .whl href links
     links = re.findall(r'href=["\']([^"\']*\.whl)["\']', html)
     if not links:
         links = re.findall(r'([\w\-\.]+\.whl)', html)
 
-    def _abs(link: str) -> str:
-        if link.startswith("http"):
-            return link
-        return f"{index_url}{link.split('/')[-1]}"
-
-    # Normalise torch version: "2.7.0" -> "27" (index uses "torch27", not "torch270")
-    parts = torch_ver.split(".")
-    major, minor = int(parts[0]), int(parts[1])
-    tv_tag = f"{major}{minor}"
-
-    def _candidates(maj: int, min_: int) -> list[str]:
-        # Index display names use "torch26", GitHub URLs use "torch2.6"
-        tags = [f"torch{maj}{min_}", f"torch{maj}.{min_}"]
-        return [
-            _abs(link) for link in links
-            if python_tag in link.split("/")[-1]
-            and platform_tag in link.split("/")[-1]
-            and any(t in link.split("/")[-1] for t in tags)
-        ]
-
-    # Try exact version first, then fall back to lower minor versions
-    for m in range(minor, -1, -1):
-        matches = _candidates(major, m)
-        if matches:
-            if m != minor:
-                print(f"[setup] NOTE: No wheel for torch{tv_tag} — using torch{major}{m} fallback.")
-            return matches[0]
-
-    return None
+    candidates: list[WheelCandidate] = []
+    seen: set[str] = set()
+    for link in links:
+        filename = link.split("/")[-1]
+        if filename in seen:
+            continue
+        seen.add(filename)
+        url = link if link.startswith("http") else f"{index_url}{filename}"
+        try:
+            candidates.append(parse_wheel_candidate(filename, source, requirement=lib_name, url=url))
+        except ValueError:
+            continue
+    return tuple(sorted(candidates, key=lambda candidate: candidate.filename))
 
 
-def _install_cuda_wheels(venv: Path, gpu_sm: int, platform_tag: str) -> None:
-    """Download and install custom CUDA wheels from pozzettiandrea.github.io."""
-    if platform_tag not in {"win_amd64", "linux_x86_64"}:
-        raise RuntimeError(
-            f"[setup] Refusing unsupported CUDA wheel platform tag '{platform_tag}'. "
-            "This script only knows how to query win_amd64 and linux_x86_64 wheels."
-        )
-    python_tag = _python_tag()
-    torch_ver    = _get_torch_version(venv)
+def _url_candidates(source: WheelSource, lib_name: str) -> tuple[WheelCandidate, ...]:
+    target = source.location.replace("{lib_name}", lib_name)
+    if not target.endswith(".whl"):
+        return ()
+    filename = target.split("/")[-1]
+    try:
+        return (parse_wheel_candidate(filename, source, requirement=lib_name, url=target),)
+    except ValueError:
+        return ()
 
-    print(f"[setup] Installing CUDA wheels (python={python_tag}, platform={platform_tag}, torch={torch_ver}) …")
+
+def _build_native_runtime_environment(context: SetupContext, torch_version: str) -> RuntimeEnvironment:
+    return RuntimeEnvironment(
+        system=context.system,
+        machine=context.machine,
+        python_tag=context.python_tag,
+        python_version=context.python_version,
+        torch_version=torch_version,
+        cuda_version=str(context.cuda_version) if context.cuda_version else os.environ.get("TRELLIS2_CUDA_VERSION", ""),
+        gpu_sm=str(context.gpu_sm),
+        asset_groups={"generate": True, "refine": False},
+        refine_lab_verified=False,
+    )
+
+
+def _empty_dependency_result(name: str, detail: str) -> dict[str, object]:
+    return {
+        "name": name,
+        "status": "missing",
+        "detail": detail,
+        "selected_source": None,
+        "install_target": None,
+        "source_events": [],
+        "tried_sources": [],
+        "checked_candidates": [],
+    }
+
+
+def _resolve_native_dependency(
+    context: SetupContext,
+    env: RuntimeEnvironment,
+    lib_name: str,
+) -> tuple[WheelResolutionResult, list[dict[str, object]]]:
+    candidates: list[WheelCandidate] = []
+    source_events: list[dict[str, object]] = []
+    for source in context.wheel_sources:
+        source_candidates, event = _source_candidates_for_requirement(source, lib_name, env)
+        candidates.extend(source_candidates)
+        source_events.append(event)
+    return resolve_wheel_candidate(lib_name, env, context.wheel_sources, candidates), source_events
+
+
+def _install_native_wheels(context: SetupContext) -> tuple[dict[str, dict[str, object]], str]:
+    """Best-effort native wheel resolution/install with structured reporting."""
+    torch_ver = _get_torch_version(context.venv_dir)
+    env = _build_native_runtime_environment(context, torch_ver)
+
+    print(
+        f"[setup] Phase 2/3: resolving native wheels (python={context.python_tag}, "
+        f"host={context.system}/{context.machine}, torch={torch_ver or 'unknown'}) …"
+    )
+
+    dependency_results = {
+        name: _empty_dependency_result(name, "setup phase did not evaluate this dependency yet")
+        for name in KNOWN_DEPENDENCIES
+    }
+
+    gguf_report = comfyui_gguf_support_file_report(comfyui_gguf_target_dir(_site_packages(context.venv_dir)))
+    gguf_target_dir = comfyui_gguf_target_dir(_site_packages(context.venv_dir))
+    gguf_report = comfyui_gguf_support_file_report(gguf_target_dir)
+    dependency_results["comfyui_gguf_support_files"] = {
+        "name": "comfyui_gguf_support_files",
+        "status": gguf_report["status"],
+        "detail": gguf_report["detail"],
+        "selected_source": "base-install",
+        "install_target": str(gguf_target_dir),
+        "source_events": [],
+        "tried_sources": [],
+        "checked_candidates": [],
+        "missing_files": gguf_report["missing"],
+    }
 
     for lib in _CUDA_WHEELS:
-        print(f"[setup] Finding wheel for {lib} …")
-        url = _find_wheel_url(lib, python_tag, platform_tag, torch_ver)
-        if url is None:
+        resolution, source_events = _resolve_native_dependency(context, env, lib)
+        canonical = lib.replace("-", "_")
+        result = {
+            "name": canonical,
+            "status": "missing",
+            "detail": resolution.detail,
+            "selected_source": resolution.selected_source.label if resolution.selected_source else None,
+            "install_target": _redact_url(resolution.selected_candidate.install_target) if resolution.selected_candidate else None,
+            "source_events": source_events,
+            "tried_sources": [_redact_source_location(source) for source in resolution.tried_sources],
+            "checked_candidates": list(resolution.checked_candidates),
+        }
+
+        selected = resolution.selected_candidate
+        if selected is None:
+            if context.platform_tag is None and not any(event["kind"] in {"wheelhouse", "index", "url"} and event["status"] == "checked" for event in source_events if event["source"] != "public-pozzettiandrea"):
+                result["status"] = "unsupported"
+            elif any(event["status"] == "skipped" for event in source_events):
+                result["status"] = "skipped"
             if lib in _CUDA_WHEELS_REQUIRED:
-                print(
-                    f"[setup] ERROR: No compatible wheel found for {lib} (torch {torch_ver}).\n"
-                    f"[setup]   This is a required dependency — the extension will fail to load.\n"
-                    f"[setup]   Check https://pozzettiandrea.github.io/cuda-wheels/{lib}/ for available wheels."
-                )
+                print(f"[setup] WARNING: required native wheel missing for {lib}. {resolution.detail}")
             else:
-                print(f"[setup] WARNING: No wheel found for {lib} — texture baking will be unavailable.")
+                print(f"[setup] NOTE: optional native wheel missing for {lib}. {resolution.detail}")
+            dependency_results[canonical] = result
             continue
-        print(f"[setup] Installing {lib} from {url} …")
+
+        print(f"[setup] Installing {lib} from {_redact_url(selected.install_target)} ({selected.source.label}) …")
         try:
-            _pip(venv, "install", url)
+            _pip(context.venv_dir, "install", selected.install_target)
+            result["status"] = "installed"
+            result["detail"] = f"installed from {selected.source.label}"
             print(f"[setup] {lib} installed.")
         except subprocess.CalledProcessError as exc:
-            if lib in _CUDA_WHEELS_REQUIRED:
-                print(f"[setup] ERROR: Failed to install {lib} ({exc}). The extension will not load.")
-            else:
-                print(f"[setup] WARNING: Failed to install {lib} ({exc}). Texture baking may be unavailable.")
+            result["status"] = "failed"
+            result["detail"] = f"install failed: {exc}"
+            print(f"[setup] WARNING: Failed to install {lib} ({exc}).")
+        dependency_results[canonical] = result
+
+    for dep in ("spconv", "cumm"):
+        dependency_results[dep] = {
+            "name": dep,
+            "status": "unsupported" if context.system.lower() == "linux" and context.machine.lower() in {"aarch64", "arm64"} else "missing",
+            "detail": "setup.py does not install this dependency in the clean rebuild slice",
+            "selected_source": None,
+            "install_target": None,
+            "source_events": [],
+            "tried_sources": [],
+            "checked_candidates": [],
+        }
+
+    return dependency_results, torch_ver
+
+
+def _known_dependencies_for_report(dependency_results: dict[str, dict[str, object]]) -> dict[str, dict[str, str]]:
+    known: dict[str, dict[str, str]] = {}
+    for name, result in dependency_results.items():
+        status = str(result.get("status", "missing"))
+        if status == "installed":
+            state = "available"
+        elif status == "unsupported":
+            state = "unsupported"
+        else:
+            state = "missing"
+        known[name] = {"state": state, "detail": str(result.get("detail", ""))}
+    return known
+
+
+def _build_final_runtime_environment(
+    context: SetupContext,
+    dependency_results: dict[str, dict[str, object]],
+    torch_version: str,
+) -> RuntimeEnvironment:
+    return RuntimeEnvironment(
+        system=context.system,
+        machine=context.machine,
+        python_tag=context.python_tag,
+        python_version=context.python_version,
+        torch_version=torch_version,
+        cuda_version=str(context.cuda_version) if context.cuda_version else "",
+        gpu_sm=str(context.gpu_sm),
+        known_dependencies=_known_dependencies_for_report(dependency_results),
+        asset_groups={"generate": True, "refine": False},
+        refine_lab_verified=False,
+    )
+
+
+def _build_next_actions(
+    context: SetupContext,
+    dependency_results: dict[str, dict[str, object]],
+    generate_report,
+    refine_report,
+) -> list[str]:
+    actions: list[str] = []
+    missing_required = [
+        name for name in _CUDA_WHEELS_REQUIRED
+        if dependency_results[name.replace("-", "_")]["status"] != "installed"
+    ]
+    if missing_required:
+        actions.append(
+            "Provide matching native wheels via TRELLIS2_WHEELHOUSE or TRELLIS2_EXTRA_WHEEL_INDEX for: "
+            + ", ".join(sorted(missing_required))
+        )
+    if context.platform_tag is None:
+        actions.append(
+            "Public pozzettiandrea native-wheel queries were skipped for this host; use a local/private ARM64 wheel source instead."
+        )
+    if dependency_results["comfyui_gguf_support_files"]["status"] != "installed":
+        actions.append(
+            "Re-run the extension setup/repair path to restore the required ComfyUI-GGUF support files."
+        )
+    if refine_report.blockers:
+        actions.append("Keep refine/texturing hidden until required dependency and runtime gates pass.")
+    if not missing_required and generate_report.allowed:
+        actions.append("Base setup completed and generate dependency gates are satisfied for this setup slice.")
+    return actions
+
+
+def _write_setup_report(ext_dir: Path, report: dict[str, object]) -> Path:
+    report_path = ext_dir / _SETUP_REPORT_FILENAME
+    report_path.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    return report_path
+
+
+def _print_setup_summary(report: dict[str, object]) -> None:
+    print("[setup] Phase 3/3 summary")
+    print(f"[setup]   status: {report['status']}")
+    platform_info = report["platform"]
+    python_info = report["python"]
+    cuda_info = report["cuda"]
+    print(
+        "[setup]   host: "
+        f"{platform_info['system']}/{platform_info['machine']} "
+        f"python={python_info['tag']} ({python_info['version']}) gpu_sm={cuda_info['gpu_sm']} cuda={cuda_info['cuda_version'] or 'unknown'}"
+    )
+    print(f"[setup]   wheel sources: {', '.join(source['location'] for source in report['wheel_sources'])}")
+    capabilities = report["capabilities"]
+    print(
+        f"[setup]   generate={capabilities['generate']['state']} refine={capabilities['refine']['state']}"
+    )
+    for name, dep in sorted(report["dependencies"].items()):
+        print(f"[setup]   dep {name}: {dep['status']} - {dep['detail']}")
+    for action in report["next_actions"]:
+        print(f"[setup]   next: {action}")
+
+
+def _phase0_collect_and_plan(
+    python_exe: str,
+    ext_dir: Path,
+    gpu_sm: int,
+    cuda_version: int = 0,
+    *,
+    trellis_wheelhouse: str | None = None,
+    trellis_extra_wheel_index: str | None = None,
+    trellis_extra_wheel_url: str | None = None,
+    system: str | None = None,
+    machine: str | None = None,
+) -> tuple[SetupContext, dict[str, object]]:
+    context = _build_setup_context(
+        python_exe,
+        ext_dir,
+        gpu_sm,
+        cuda_version,
+        trellis_wheelhouse=trellis_wheelhouse,
+        trellis_extra_wheel_index=trellis_extra_wheel_index,
+        trellis_extra_wheel_url=trellis_extra_wheel_url,
+        system=system,
+        machine=machine,
+    )
+    policy = _preflight_setup_policy(gpu_sm, cuda_version, system=context.system, machine=context.machine)
+    print("[setup] Phase 0/3: collected setup context and wheel source configuration")
+    return context, policy
+
+
+def _phase1_install_base(context: SetupContext) -> dict[str, object]:
+    print(f"[setup] Phase 1/3: creating venv at {context.venv_dir} …")
+    subprocess.run([context.python_exe, "-m", "venv", str(context.venv_dir)], check=True)
+
+    torch_pkgs, torch_index, torch_message = _select_torch_packages(context.gpu_sm, context.cuda_version)
+    print(f"[setup] {torch_message}")
+    print("[setup] Installing PyTorch …")
+    _pip(context.venv_dir, "install", *torch_pkgs, "--index-url", torch_index)
+
+    print("[setup] Installing core Python dependencies …")
+    _pip(context.venv_dir, "install", *_PY_PACKAGES)
+
+    print("[setup] Installing rembg …")
+    if context.gpu_sm >= 70:
+        _pip(context.venv_dir, "install", "rembg[gpu]")
+    else:
+        _pip(context.venv_dir, "install", "rembg", "onnxruntime")
+
+    torch_ver = _get_torch_version(context.venv_dir)
+    if torch_ver:
+        _install_triton_windows(context.venv_dir, torch_ver, context.gpu_sm)
+
+    _install_trellis2_gguf(context.venv_dir)
+    _install_comfyui_gguf(context.venv_dir)
+
+    return {
+        "venv": str(context.venv_dir),
+        "torch_packages": torch_pkgs,
+        "torch_index": _redact_url(torch_index),
+        "torch_version": torch_ver,
+        "core_packages": list(_PY_PACKAGES),
+        "rembg": "rembg[gpu]" if context.gpu_sm >= 70 else "rembg + onnxruntime",
+    }
+
+
+def _plan_setup(
+    python_exe: str,
+    ext_dir: Path,
+    gpu_sm: int,
+    cuda_version: int = 0,
+    *,
+    trellis_wheelhouse: str | None = None,
+    trellis_extra_wheel_index: str | None = None,
+    trellis_extra_wheel_url: str | None = None,
+    system: str | None = None,
+    machine: str | None = None,
+) -> dict[str, object]:
+    context, policy = _phase0_collect_and_plan(
+        python_exe,
+        ext_dir,
+        gpu_sm,
+        cuda_version,
+        trellis_wheelhouse=trellis_wheelhouse,
+        trellis_extra_wheel_index=trellis_extra_wheel_index,
+        trellis_extra_wheel_url=trellis_extra_wheel_url,
+        system=system,
+        machine=machine,
+    )
+    torch_pkgs, torch_index, torch_message = _select_torch_packages(context.gpu_sm, context.cuda_version)
+    return {
+        "phase": 0,
+        "continue_install_base": bool(policy["continue_install_base"]),
+        "native_wheel_query_supported": bool(policy["native_wheel_query_supported"]),
+        "platform": {
+            "system": context.system,
+            "machine": context.machine,
+            "platform_tag": context.platform_tag,
+        },
+        "python": {
+            "tag": context.python_tag,
+            "version": context.python_version,
+            "executable": context.python_exe,
+        },
+        "cuda": {
+            "gpu_sm": str(context.gpu_sm),
+            "cuda_version": str(context.cuda_version) if context.cuda_version else "",
+            "torch_packages": torch_pkgs,
+            "torch_index": _redact_url(torch_index),
+            "selection_detail": torch_message,
+        },
+        "wheel_sources": _serialize_wheel_sources(context.wheel_sources),
+        "policy_notes": list(policy.get("policy_notes", ())),
+        "venv_dir": str(context.venv_dir),
+    }
 
 
 # --------------------------------------------------------------------------- #
@@ -377,22 +884,21 @@ def _install_trellis2_gguf(venv: Path) -> None:
 def _install_comfyui_gguf(venv: Path) -> None:
     """
     Download ops.py / dequant.py / loader.py from city96/ComfyUI-GGUF into the
-    path that trellis2_gguf's _setup_native_gguf() searches:
-      <venv>/Lib/ComfyUI-GGUF/
+    path that trellis2_gguf's GGUF helpers search:
+      <site-packages parent>/ComfyUI-GGUF/
     Without these files the GGUF dequant falls back to a CPU implementation.
     """
-    sp       = _site_packages(venv)
-    gguf_dir = sp.parent.parent / "Lib" / "ComfyUI-GGUF"   # <venv>/Lib/ComfyUI-GGUF
-    _FILES   = ["ops.py", "dequant.py", "loader.py"]
+    sp = _site_packages(venv)
+    gguf_dir = comfyui_gguf_target_dir(sp)
 
-    if all((gguf_dir / f).exists() for f in _FILES):
+    if not comfyui_gguf_support_file_report(gguf_dir)["missing"]:
         print("[setup] ComfyUI-GGUF already installed, skipping.")
         return
 
     gguf_dir.mkdir(parents=True, exist_ok=True)
     base = "https://raw.githubusercontent.com/city96/ComfyUI-GGUF/main/"
     print(f"[setup] Installing ComfyUI-GGUF (city96) GGUF ops to {gguf_dir} …")
-    for fname in _FILES:
+    for fname in COMFYUI_GGUF_REQUIRED_FILES:
         dest = gguf_dir / fname
         if dest.exists():
             continue
@@ -402,68 +908,102 @@ def _install_comfyui_gguf(venv: Path) -> None:
             print(f"[setup]   downloaded {fname}")
         except Exception as exc:
             print(f"[setup] WARNING: could not download ComfyUI-GGUF/{fname}: {exc}")
-    print("[setup] ComfyUI-GGUF installed.")
+    report = comfyui_gguf_support_file_report(gguf_dir)
+    if report["status"] == "installed":
+        print("[setup] ComfyUI-GGUF installed.")
+        return
+    print(f"[setup] WARNING: ComfyUI-GGUF support files remain {report['status']}: {report['detail']}")
 
 # --------------------------------------------------------------------------- #
 # Main setup                                                                   #
 # --------------------------------------------------------------------------- #
 
 def setup(python_exe: str, ext_dir: Path, gpu_sm: int, cuda_version: int = 0) -> None:
-    policy = _preflight_setup_policy(gpu_sm, cuda_version)
-    platform_tag = policy["platform_tag"]
-    assert isinstance(platform_tag, str)
+    setup_with_config(
+        python_exe=python_exe,
+        ext_dir=ext_dir,
+        gpu_sm=gpu_sm,
+        cuda_version=cuda_version,
+    )
 
-    venv = ext_dir / "venv"
 
-    print(f"[setup] Creating venv at {venv} …")
-    subprocess.run([python_exe, "-m", "venv", str(venv)], check=True)
+def setup_with_config(
+    python_exe: str,
+    ext_dir: Path,
+    gpu_sm: int,
+    cuda_version: int = 0,
+    *,
+    trellis_wheelhouse: str | None = None,
+    trellis_extra_wheel_index: str | None = None,
+    trellis_extra_wheel_url: str | None = None,
+) -> dict[str, object]:
+    context, policy = _phase0_collect_and_plan(
+        python_exe,
+        ext_dir,
+        gpu_sm,
+        cuda_version,
+        trellis_wheelhouse=trellis_wheelhouse,
+        trellis_extra_wheel_index=trellis_extra_wheel_index,
+        trellis_extra_wheel_url=trellis_extra_wheel_url,
+    )
 
-    # ── PyTorch — select build based on GPU architecture / CUDA driver ── #
-    if gpu_sm >= 100 or cuda_version >= 128:
-        # Blackwell (RTX 50xx, B100…) — SM 12.x kernels require PyTorch 2.7+
-        torch_pkgs  = ["torch==2.7.0", "torchvision==0.22.0"]
-        torch_index = "https://download.pytorch.org/whl/cu128"
-        print(f"[setup] GPU SM {gpu_sm}, CUDA {cuda_version} -> PyTorch 2.7 + CUDA 12.8 (Blackwell)")
-    elif gpu_sm == 0 or gpu_sm >= 70:
-        # Volta / Turing / Ampere / Ada / Hopper
-        torch_pkgs  = ["torch==2.6.0", "torchvision==0.21.0"]
-        torch_index = "https://download.pytorch.org/whl/cu126"
-        print(f"[setup] GPU SM {gpu_sm} -> PyTorch 2.6 + CUDA 12.6")
-    else:
-        # Pascal (SM 6.x) — last PyTorch with SM 6.1 support
-        torch_pkgs  = ["torch==2.5.1", "torchvision==0.20.1"]
-        torch_index = "https://download.pytorch.org/whl/cu118"
-        print(f"[setup] GPU SM {gpu_sm} (legacy) -> PyTorch 2.5 + CUDA 11.8")
+    if not policy["continue_install_base"]:
+        raise RuntimeError("[setup] Base install policy rejected setup before phase 1.")
 
-    print("[setup] Installing PyTorch …")
-    _pip(venv, "install", *torch_pkgs, "--index-url", torch_index)
+    base_phase = _phase1_install_base(context)
+    dependency_results, torch_version = _install_native_wheels(context)
 
-    # ── Core Python dependencies ─────────────────────────────────────── #
-    print("[setup] Installing core Python dependencies …")
-    _pip(venv, "install", *_PY_PACKAGES)
+    final_env = _build_final_runtime_environment(context, dependency_results, torch_version)
+    generate_report = DependencyPreflight.evaluate("generate", final_env)
+    refine_report = DependencyPreflight.evaluate("refine", final_env)
 
-    # ── rembg (background removal) ───────────────────────────────────── #
-    print("[setup] Installing rembg …")
-    if gpu_sm >= 70:
-        _pip(venv, "install", "rembg[gpu]")
-    else:
-        _pip(venv, "install", "rembg", "onnxruntime")
+    native_statuses = {result["status"] for result in dependency_results.values()}
+    status = "success"
+    if any(result == "failed" for result in native_statuses):
+        status = "partial"
+    if any(result in {"missing", "skipped", "unsupported"} for result in native_statuses):
+        status = "partial"
 
-    # ── Custom CUDA wheels (cumesh, nvdiffrast, flex_gemm, …) ─────────── #
-    _install_cuda_wheels(venv, gpu_sm, platform_tag)
+    report = {
+        "status": status,
+        "phases": {
+            "phase0": "completed",
+            "phase1": "completed",
+            "phase2": "completed",
+            "phase3": "completed",
+        },
+        "platform": {
+            "system": context.system,
+            "machine": context.machine,
+            "platform_tag": context.platform_tag,
+            "native_wheel_query_supported": bool(policy["native_wheel_query_supported"]),
+        },
+        "python": {
+            "tag": context.python_tag,
+            "version": context.python_version,
+            "executable": context.python_exe,
+        },
+        "cuda": {
+            "gpu_sm": str(context.gpu_sm),
+            "cuda_version": str(context.cuda_version) if context.cuda_version else "",
+            "torch_version": torch_version,
+            "torch_index": base_phase["torch_index"],
+        },
+        "wheel_sources": _serialize_wheel_sources(context.wheel_sources),
+        "dependencies": dependency_results,
+        "capabilities": {
+            "generate": _serialize_capability_report(generate_report),
+            "refine": _serialize_capability_report(refine_report),
+        },
+        "policy_notes": list(policy.get("policy_notes", ())),
+        "next_actions": _build_next_actions(context, dependency_results, generate_report, refine_report),
+    }
 
-    # ── triton-windows ────────────────────────────────────────────────── #
-    torch_ver = _get_torch_version(venv)
-    if torch_ver:
-        _install_triton_windows(venv, torch_ver, gpu_sm)
-
-    # ── trellis2_gguf source ──────────────────────────────────────────── #
-    _install_trellis2_gguf(venv)
-
-    # ── ComfyUI-GGUF (city96) — native GGUF dequant on GPU ───────────── #
-    _install_comfyui_gguf(venv)
-
-    print("[setup] Done. Venv ready at:", venv)
+    report_path = _write_setup_report(context.ext_dir, report)
+    _print_setup_summary(report)
+    print(f"[setup] Wrote report to {report_path}")
+    print("[setup] Done. Venv ready at:", context.venv_dir)
+    return report
 
 
 if __name__ == "__main__":
@@ -471,14 +1011,17 @@ if __name__ == "__main__":
         # PowerShell may pass the surrounding single quotes as part of the string
         raw = sys.argv[1].strip("'\"")
         args = json.loads(raw)
-        setup(
+        setup_with_config(
             python_exe   = args["python_exe"],
             ext_dir      = Path(args["ext_dir"]),
             gpu_sm       = int(args.get("gpu_sm",       86)),
             cuda_version = int(args.get("cuda_version",  0)),
+            trellis_wheelhouse = args.get("trellis_wheelhouse"),
+            trellis_extra_wheel_index = args.get("trellis_extra_wheel_index"),
+            trellis_extra_wheel_url = args.get("trellis_extra_wheel_url"),
         )
     elif len(sys.argv) >= 4:
-        setup(
+        setup_with_config(
             python_exe   = sys.argv[1],
             ext_dir      = Path(sys.argv[2]),
             gpu_sm       = int(sys.argv[3]),
