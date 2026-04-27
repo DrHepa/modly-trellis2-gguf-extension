@@ -63,10 +63,11 @@ class WheelCandidate:
     torch_tag: str = ""
     cuda_tag: str = ""
     url: str = ""
+    local_path: str = ""
 
     @property
     def install_target(self) -> str:
-        return self.url or self.filename
+        return self.local_path or self.url or self.filename
 
 
 @dataclass(frozen=True)
@@ -265,7 +266,13 @@ def build_wheel_sources(
 
 
 def parse_wheel_candidate(filename: str, source: WheelSource, requirement: str | None = None, url: str = "") -> WheelCandidate:
-    wheel_name = Path(filename).name
+    raw_path = Path(filename).expanduser()
+    local_path = ""
+    if source.kind == "wheelhouse":
+        candidate_path = raw_path if raw_path.is_absolute() else Path(source.location).expanduser() / raw_path
+        local_path = str(candidate_path.resolve())
+
+    wheel_name = raw_path.name
     if not wheel_name.endswith(".whl"):
         raise ValueError(f"Unsupported wheel filename: {filename}")
 
@@ -301,6 +308,7 @@ def parse_wheel_candidate(filename: str, source: WheelSource, requirement: str |
         torch_tag=torch_match.group("tag") if torch_match else "",
         cuda_tag=cuda_match.group("tag") if cuda_match else "",
         url=url,
+        local_path=local_path,
     )
 
 
@@ -396,7 +404,7 @@ def discover_local_wheel_candidates(source: WheelSource, requirement: str | None
     wheelhouse = Path(source.location).expanduser()
     if not wheelhouse.exists() or not wheelhouse.is_dir():
         return ()
-    return build_wheel_candidates(source, [path.name for path in sorted(wheelhouse.glob("*.whl"))], requirement=requirement)
+    return build_wheel_candidates(source, [str(path.resolve()) for path in sorted(wheelhouse.glob("*.whl"))], requirement=requirement)
 
 
 def _distribution_matches_requirement(

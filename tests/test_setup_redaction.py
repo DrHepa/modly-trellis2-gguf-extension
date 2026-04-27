@@ -1,4 +1,5 @@
 import importlib.util
+import tempfile
 import subprocess
 import sys
 import unittest
@@ -278,6 +279,70 @@ class GenerateNativeWheelReportingTests(unittest.TestCase):
         self.assertFalse(any("comfyui_gguf_support_files: missing" in note for note in report["policy_notes"]))
         self.assertTrue(any("comfyui_gguf_support_files: missing" in note for note in report["phase0_policy_notes"]))
         self.assertTrue(any("Linux ARM64 continues with base install" in note for note in report["policy_notes"]))
+
+    def test_local_wheelhouse_native_install_uses_absolute_path(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            wheelhouse = root / "wheelhouse"
+            wheelhouse.mkdir()
+            for filename in (
+                "cumesh-0.0.1-cp312-cp312-linux_aarch64.whl",
+                "flex_gemm-1.0.0-cp312-cp312-linux_aarch64.whl",
+                "o_voxel-0.0.1-cp312-cp312-linux_aarch64.whl",
+                "nvdiffrast-0.4.0-cp312-cp312-linux_aarch64.whl",
+            ):
+                (wheelhouse / filename).write_text("stub", encoding="utf-8")
+
+            site_packages = root / "venv" / "lib" / "python3.12" / "site-packages"
+            gguf_dir = site_packages.parent / "ComfyUI-GGUF"
+            gguf_dir.mkdir(parents=True)
+            for name in ("ops.py", "dequant.py", "loader.py"):
+                (gguf_dir / name).write_text("ok", encoding="utf-8")
+
+            context = setup_module._build_setup_context(
+                python_exe=sys.executable,
+                ext_dir=root / "ext",
+                gpu_sm=121,
+                cuda_version=128,
+                trellis_wheelhouse=str(wheelhouse),
+                system="Linux",
+                machine="aarch64",
+            )
+
+            original_pip = setup_module._pip
+            original_get_torch_version = setup_module._get_torch_version
+            original_site_packages = setup_module._site_packages
+            pip_calls = []
+
+            try:
+                def fake_pip(*args):
+                    pip_calls.append(args)
+
+                setup_module._pip = fake_pip
+                setup_module._get_torch_version = lambda _venv: "2.7.0"
+                setup_module._site_packages = lambda _venv: site_packages
+
+                dependency_results, _torch_version = setup_module._install_native_wheels(context)
+            finally:
+                setup_module._pip = original_pip
+                setup_module._get_torch_version = original_get_torch_version
+                setup_module._site_packages = original_site_packages
+
+            expected_paths = {
+                str(wheelhouse / "cumesh-0.0.1-cp312-cp312-linux_aarch64.whl"),
+                str(wheelhouse / "flex_gemm-1.0.0-cp312-cp312-linux_aarch64.whl"),
+                str(wheelhouse / "o_voxel-0.0.1-cp312-cp312-linux_aarch64.whl"),
+                str(wheelhouse / "nvdiffrast-0.4.0-cp312-cp312-linux_aarch64.whl"),
+            }
+            actual_paths = {args[2] for args in pip_calls}
+
+            self.assertEqual({args[1] for args in pip_calls}, {"install"})
+            self.assertEqual(actual_paths, expected_paths)
+            self.assertEqual(
+                dependency_results["cumesh"]["install_target"],
+                str(wheelhouse / "cumesh-0.0.1-cp312-cp312-linux_aarch64.whl"),
+            )
+            self.assertEqual(dependency_results["cumesh"]["selected_source"], "local-wheelhouse")
 
 
 if __name__ == "__main__":

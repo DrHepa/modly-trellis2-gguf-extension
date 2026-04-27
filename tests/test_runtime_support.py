@@ -202,6 +202,32 @@ class WheelResolutionTests(unittest.TestCase):
         self.assertEqual(result.selected_source, self.local_source)
         self.assertEqual(result.selected_candidate.filename, "cumesh-1.0.0-cp312-none-manylinux_2_17_aarch64.whl")
 
+    def test_local_wheelhouse_install_target_resolves_to_absolute_path(self):
+        candidates = build_wheel_candidates(
+            self.local_source,
+            ["cumesh-1.0.0-cp312-none-manylinux_2_17_aarch64.whl"],
+        )
+
+        result = resolve_wheel_candidate("cumesh", self.env_arm64, (self.local_source,), candidates)
+
+        self.assertEqual(result.state, "resolved")
+        self.assertEqual(
+            result.selected_candidate.install_target,
+            "/wheels/cumesh-1.0.0-cp312-none-manylinux_2_17_aarch64.whl",
+        )
+
+    def test_remote_candidate_install_target_preserves_url(self):
+        candidates = build_wheel_candidates(
+            self.public_source,
+            ["cumesh-1.0.0-cp312-none-manylinux_2_17_aarch64.whl"],
+            url_map={"cumesh-1.0.0-cp312-none-manylinux_2_17_aarch64.whl": "https://example.invalid/cumesh.whl"},
+        )
+
+        result = resolve_wheel_candidate("cumesh", self.env_arm64, (self.public_source,), candidates)
+
+        self.assertEqual(result.state, "resolved")
+        self.assertEqual(result.selected_candidate.install_target, "https://example.invalid/cumesh.whl")
+
     def test_ranking_uses_filename_as_deterministic_tie_break(self):
         candidates = build_wheel_candidates(
             self.local_source,
