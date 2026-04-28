@@ -12,7 +12,7 @@ Pipeline stages:
   3. Shape SLaT diffusion        (slat_steps)
   4. Minimal geometry export -> GLB
 
-Model weights are downloaded once to <models>/trellis2/generate/ and reused.
+Model weights live under the exact per-node model_dir that Modly passes in.
 """
 from __future__ import annotations
 
@@ -154,11 +154,11 @@ class Trellis2GGUFGenerator(BaseGenerator):
     @property
     def _weights_dir(self) -> Path:
         """
-        model_dir = <models>/trellis2/{generate|refine}
-        weights   = <models>/trellis2/  (one level up)
+        Modly now passes the exact per-node model_dir for the active node
+        (for example <models>/trellis2/generate). Keep that path intact so
+        asset resolution and auto-downloads use the node-local directory
+        instead of collapsing back to the shared parent.
         """
-        if self.model_dir.name in ("generate", "refine"):
-            return self.model_dir.parent
         return self.model_dir
 
     # ------------------------------------------------------------------ #
