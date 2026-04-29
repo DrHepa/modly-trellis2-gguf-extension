@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import os
 import re
+import hashlib
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from fnmatch import fnmatchcase
 from pathlib import Path, PureWindowsPath
 from typing import Any, Literal
+from urllib.parse import urlsplit, urlunsplit
 
 
 Capability = Literal["generate", "refine"]
@@ -138,6 +140,7 @@ KNOWN_DEPENDENCIES = tuple(DEPENDENCY_CATALOG)
 COMFYUI_GGUF_REQUIRED_FILES: tuple[str, ...] = ("ops.py", "dequant.py", "loader.py")
 
 _DEFAULT_PUBLIC_WHEEL_INDEX = "https://pozzettiandrea.github.io/cuda-wheels/"
+WHEEL_PROVENANCE_REQUIRED_PACKAGES: tuple[str, ...] = ("cumesh", "flex_gemm", "o_voxel", "nvdiffrast")
 
 
 def comfyui_gguf_target_dir(site_packages: str | Path) -> Path | PureWindowsPath:
@@ -407,6 +410,165 @@ def discover_local_wheel_candidates(source: WheelSource, requirement: str | None
     return build_wheel_candidates(source, [str(path.resolve()) for path in sorted(wheelhouse.glob("*.whl"))], requirement=requirement)
 
 
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(65536), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _public_local_path_hint(path: str | Path) -> str:
+    name = Path(path).expanduser().name
+    return f"<wheelhouse:{name or 'unknown'}>"
+
+
+def _redact_public_location(value: str) -> str:
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    try:
+        parts = urlsplit(raw)
+    except Exception:
+        return raw
+    if not parts.scheme or not parts.netloc:
+        return raw
+    host = parts.hostname or ""
+    if parts.port:
+        host = f"{host}:{parts.port}"
+    netloc = f"***:***@{host}" if parts.username or parts.password else host
+    return urlunsplit((parts.scheme, netloc, parts.path, "", ""))
+
+
+def _serialize_provenance_source(source: WheelSource) -> dict[str, Any]:
+    if source.kind == "wheelhouse":
+        wheelhouse = Path(source.location).expanduser()
+        candidate_count = len(tuple(sorted(wheelhouse.glob("*.whl")))) if wheelhouse.exists() and wheelhouse.is_dir() else 0
+        return {
+            "label": source.label,
+            "kind": source.kind,
+            "status": "available" if wheelhouse.exists() and wheelhouse.is_dir() else "missing",
+            "location_hint": _public_local_path_hint(source.location),
+            "candidate_count": candidate_count,
+        }
+    return {
+        "label": source.label,
+        "kind": source.kind,
+        "status": "planned",
+        "location": _redact_public_location(source.location),
+    }
+
+
+def collect_wheel_provenance(
+    required_packages: Iterable[str],
+    env: RuntimeEnvironment,
+    sources: Iterable[WheelSource],
+) -> dict[str, Any]:
+    required = tuple(normalize_dependency_name(name) for name in required_packages)
+    ordered_sources = tuple(sorted(sources, key=lambda source: (source.priority, source.label)))
+    source_reports = [_serialize_provenance_source(source) for source in ordered_sources]
+    wheelhouse_sources = tuple(source for source in ordered_sources if source.kind == "wheelhouse")
+
+    if not wheelhouse_sources:
+        blocking_reasons = [
+            f"wheel_provenance: no local wheelhouse evidence observed for {package}"
+            for package in required
+        ]
+        return {
+            "status": "planned",
+            "required_packages": list(required),
+            "entries": [
+                {
+                    "package": package,
+                    "status": "planned",
+                    "detail": "No local wheelhouse is configured; provenance must come from public manifest or later observed wheelhouse evidence.",
+                }
+                for package in required
+            ],
+            "sources": source_reports,
+            "coverage": {"required": len(required), "available": 0, "missing": list(required)},
+            "blocking_reasons": blocking_reasons,
+            "warnings": [],
+            "public_evidence_only": True,
+        }
+
+    all_candidates: list[WheelCandidate] = []
+    available_sources: list[WheelSource] = []
+    for source in wheelhouse_sources:
+        candidates = discover_local_wheel_candidates(source)
+        if candidates:
+            available_sources.append(source)
+            all_candidates.extend(candidates)
+
+    entries: list[dict[str, Any]] = []
+    blocking_reasons: list[str] = []
+    available_count = 0
+    for package in required:
+        resolution = resolve_wheel_candidate(package, env, available_sources, all_candidates) if available_sources else WheelResolutionResult(
+            requirement=package,
+            state="missing",
+            tried_sources=wheelhouse_sources,
+            detail=f"no compatible local wheelhouse candidate found for {package}",
+        )
+        selected = resolution.selected_candidate
+        if selected and selected.local_path and Path(selected.local_path).exists():
+            wheel_path = Path(selected.local_path)
+            available_count += 1
+            entries.append(
+                {
+                    "package": package,
+                    "status": "available",
+                    "distribution": selected.distribution,
+                    "filename": selected.filename,
+                    "version": selected.version,
+                    "build_tag": selected.build_tag,
+                    "python_tag": selected.python_tag,
+                    "platform_tag": selected.platform_tag,
+                    "torch_tag": selected.torch_tag,
+                    "cuda_tag": selected.cuda_tag,
+                    "sha256": _sha256_file(wheel_path),
+                    "size_bytes": wheel_path.stat().st_size,
+                    "source_label": selected.source.label,
+                    "source_kind": selected.source.kind,
+                    "source_location_hint": _public_local_path_hint(selected.source.location),
+                    "detail": resolution.detail,
+                }
+            )
+            continue
+
+        blocking_reasons.append(f"wheel_provenance: missing public wheel evidence for {package}")
+        entries.append(
+            {
+                "package": package,
+                "status": "missing",
+                "detail": resolution.detail,
+                "checked_candidates": list(resolution.checked_candidates),
+            }
+        )
+
+    if available_count == len(required):
+        status = "available"
+    elif available_count:
+        status = "observed"
+    else:
+        status = "missing"
+
+    return {
+        "status": status,
+        "required_packages": list(required),
+        "entries": entries,
+        "sources": source_reports,
+        "coverage": {
+            "required": len(required),
+            "available": available_count,
+            "missing": [entry["package"] for entry in entries if entry["status"] != "available"],
+        },
+        "blocking_reasons": blocking_reasons,
+        "warnings": [],
+        "public_evidence_only": True,
+    }
+
+
 def _distribution_matches_requirement(
     distribution: str,
     requirement_name: str,
@@ -639,6 +801,71 @@ class CapabilityReport:
     blockers: tuple[str, ...]
     deps: tuple[DependencyStatus, ...]
     env: RuntimeEnvironment
+
+
+def requires_arm64_generate_runtime_validation(env: RuntimeEnvironment) -> bool:
+    system = env.system.strip().lower()
+    machine = env.machine.strip().lower()
+    gpu_sm = str(env.gpu_sm or "").strip()
+    return system == "linux" and machine in {"aarch64", "arm64"} and gpu_sm == "121"
+
+
+def evaluate_generate_runtime_readiness(
+    generate_report: CapabilityReport,
+    *,
+    runtime_validation: Mapping[str, Any] | None = None,
+    trellis_patches: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    blockers = list(generate_report.blockers)
+    warnings: list[str] = []
+    required = requires_arm64_generate_runtime_validation(generate_report.env)
+
+    validation = dict(runtime_validation or {})
+    validation_status = str(validation.get("status", "not_run") or "not_run")
+    validation_blockers = [str(item) for item in validation.get("blocking_reasons", ()) if str(item).strip()]
+    validation_warnings = [str(item) for item in validation.get("warnings", ()) if str(item).strip()]
+    warnings.extend(validation_warnings)
+
+    patches = dict(trellis_patches or {})
+    patch_blockers = [str(item) for item in patches.get("blocking_reasons", ()) if str(item).strip()]
+    blockers.extend(item for item in patch_blockers if item not in blockers)
+
+    if required:
+        if validation_status not in {"passed", "success", "completed"}:
+            if validation_status in {"not_run", "skipped", "planned", "pending"}:
+                blockers.append(
+                    "runtime_validation: required Linux ARM64 Blackwell Generate validation was not run"
+                )
+            elif validation_blockers:
+                blockers.extend(item for item in validation_blockers if item not in blockers)
+            else:
+                blockers.append(
+                    f"runtime_validation: required Linux ARM64 Blackwell Generate validation status is {validation_status}"
+                )
+
+    if not blockers:
+        state: State = generate_report.state
+    elif any("unsupported" in blocker for blocker in blockers):
+        state = "unsupported"
+    elif required and validation_status in {"not_run", "skipped", "planned", "pending"}:
+        state = "unknown"
+    elif any("missing" in blocker for blocker in blockers):
+        state = "missing"
+    else:
+        state = "unknown"
+
+    return {
+        "state": state,
+        "allowed": not blockers and generate_report.allowed,
+        "blockers": blockers,
+        "required_runtime_validation": required,
+        "runtime_validation_status": validation_status,
+        "warnings": warnings,
+        "deps": [
+            {"name": dep.name, "state": dep.state, "detail": dep.detail}
+            for dep in generate_report.deps
+        ],
+    }
 
 
 @dataclass(frozen=True)

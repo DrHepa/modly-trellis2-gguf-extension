@@ -34,6 +34,15 @@ The setup flow writes `<extension dir>/setup-report.json` and prints the same hi
 - `status: partial` means base setup completed but one or more native/runtime blockers still remain
 - `capabilities.generate.blockers` and `capabilities.refine.blockers` name the specific missing, unsupported, or import-time blockers
 - On Linux ARM64, base setup may still complete while native CUDA wheels remain unavailable; the report is the setup-verified view of what is still blocked
+- `wheel_provenance` records public-safe wheel evidence for `cumesh`, `flex_gemm`, `o_voxel`, and `nvdiffrast` using filename, Python/platform tags, hash, and redacted wheelhouse hints only; private proof paths are not required for public readiness claims
+- `runtime_validation` stays `not_run` by default and only executes the no-Generate checks when `TRELLIS2_RUN_RUNTIME_VALIDATION=1` is explicitly set during setup
+
+## ARM64 public evidence rules
+
+- Public ARM64 readiness requires reproducible wheel provenance for `cumesh`, `flex_gemm`, `o_voxel`, and `nvdiffrast`
+- Provenance must be based on publishable evidence: filename, version/tags, immutable hash/reference, and safe source metadata
+- Private lab notes or private absolute wheelhouse paths are NOT used as public readiness proof
+- No-Generate runtime validation covers import/API smoke, generator bootstrap smoke, and FlexGEMM micro-smoke only; it does not load models, download assets, or run Generate
 
 ## Why Texture Mesh is deferred
 

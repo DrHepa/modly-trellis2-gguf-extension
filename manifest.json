@@ -7,6 +7,12 @@
   "version": "1.0.4",
   "author": "Lightning Pixel",
   "generator_class": "Trellis2GGUFGenerator",
+  "setup_report_contract": {
+    "runtime_validation_env": "TRELLIS2_RUN_RUNTIME_VALIDATION",
+    "wheel_provenance_required_packages": ["cumesh", "flex_gemm", "o_voxel", "nvdiffrast"],
+    "public_evidence_only": true,
+    "generate_readiness_requires_validation_on_linux_arm64_gb10": true
+  },
   "vram_gb": 8,
   "tags": ["image-to-3d", "gguf", "quantized", "geometry-only"],
   "nodes": [

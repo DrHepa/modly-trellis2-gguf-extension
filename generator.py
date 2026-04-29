@@ -18,6 +18,8 @@ from __future__ import annotations
 
 import io
 import json
+import os
+import platform
 import random
 import sys
 import threading
@@ -35,6 +37,7 @@ from runtime_support import (
     RuntimeEnvironment,
     resolve_dependency_definition,
 )
+from runtime_patches import FLEX_GEMM_ALGO_ENV, HostPlatform, resolve_flex_gemm_algo, resolve_flex_gemm_debug_policy
 from services.generators.base import BaseGenerator, smooth_progress, GenerationCancelled  # noqa: F401
 
 _EXTENSION_DIR = Path(__file__).parent
@@ -124,6 +127,49 @@ _SLAT_RESCALE_T    = 4.0
 # 49152 (old default) truncates complex objects — 999999 lets the model
 # use as many voxels as it needs for full detail.
 _MAX_NUM_TOKENS    = 150000
+
+
+def _generator_runtime_host(*, system: str | None = None, machine: str | None = None, gpu_sm: int | None = None) -> HostPlatform:
+    return HostPlatform(
+        system=system or platform.system(),
+        machine=machine or platform.machine(),
+        gpu_sm=gpu_sm,
+        python_tag=f"cp{sys.version_info.major}{sys.version_info.minor}",
+        python_version=platform.python_version(),
+    )
+
+
+def _apply_shared_flex_gemm_runtime_policy(
+    *,
+    env: dict[str, str] | None = None,
+    host: HostPlatform | None = None,
+) -> dict[str, object]:
+    env_map = env if env is not None else os.environ
+    resolved_host = host or _generator_runtime_host()
+    decision = resolve_flex_gemm_algo(env_map, resolved_host)
+    debug_policy = resolve_flex_gemm_debug_policy(env_map)
+    applied = False
+    source = "none"
+
+    if decision.status == "invalid_override":
+        raise RuntimeError(decision.blocking_reason)
+
+    if decision.source == "env_override":
+        source = "preserved_env_override"
+    elif decision.targeted_host:
+        current = str(env_map.get(FLEX_GEMM_ALGO_ENV, "")).strip()
+        if current != decision.selected:
+            env_map[FLEX_GEMM_ALGO_ENV] = decision.selected
+            applied = True
+        source = "environment"
+
+    return {
+        "host": resolved_host.to_dict(),
+        "decision": decision.to_dict(),
+        "debug": debug_policy.to_dict(),
+        "applied": applied,
+        "applied_via": source,
+    }
 
 
 class GenerateAdapter:
@@ -982,6 +1028,17 @@ class Trellis2GGUFGenerator(BaseGenerator):
         import torch  # noqa — registers CUDA DLLs on Windows before any CUDA extension
 
         self._ensure_comfyui_gguf()
+
+        gpu_sm = None
+        try:
+            if torch.cuda.is_available():
+                major, minor = torch.cuda.get_device_capability()
+                gpu_sm = int(f"{major}{minor}")
+        except Exception:
+            gpu_sm = None
+        self._runtime_bootstrap = _apply_shared_flex_gemm_runtime_policy(
+            host=_generator_runtime_host(gpu_sm=gpu_sm)
+        )
 
         # trellis2_gguf is a ComfyUI extension; stub ComfyUI-specific modules
         # so it can be used standalone.

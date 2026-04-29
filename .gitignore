@@ -6,3 +6,20 @@ docs/sdd/
 # Python generated files.
 __pycache__/
 *.py[cod]
+
+# Local setup/runtime evidence artifacts.
+setup-report.json
+setup-report.*.json
+runtime-validation*.json
+runtime-validation*.log
+*.jsonl
+*.log
+
+# Local wheel/build artifacts.
+wheelhouse/
+*.whl
+
+# Local secrets/configuration.
+.env
+.env.*
+!.env.example

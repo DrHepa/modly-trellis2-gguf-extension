@@ -30,11 +30,32 @@ from runtime_support import (
     WheelResolutionResult,
     WheelSource,
     build_wheel_sources,
+    collect_wheel_provenance,
     comfyui_gguf_support_file_report,
     comfyui_gguf_target_dir,
     discover_local_wheel_candidates,
+    evaluate_generate_runtime_readiness,
     parse_wheel_candidate,
+    requires_arm64_generate_runtime_validation,
     resolve_wheel_candidate,
+)
+from runtime_patches import (
+    FLEX_GEMM_DEBUG_ENV,
+    FLEX_GEMM_DEBUG_LOG_PATH_ENV,
+    HostPlatform,
+    RUN_RUNTIME_VALIDATION_ENV,
+    RuntimeValidationReport,
+    TRITON_OVERRIDE_VERSION,
+    TrellisPatchesReport,
+    WheelProvenanceReport,
+    apply_fdg_vae_patch_file,
+    build_flex_gemm_config_patch_plan,
+    build_flex_gemm_debug_patch_plan,
+    build_no_generate_validation_plans,
+    build_runtime_overrides_report,
+    plan_triton_override,
+    plan_fdg_vae_patch,
+    run_no_generate_validation,
 )
 
 _COMFYUI_TRELLIS2_ZIP = "https://github.com/Aero-Ex/ComfyUI-Trellis2-GGUF/archive/refs/heads/main.zip"
@@ -94,6 +115,261 @@ class SetupContext:
     wheel_sources: tuple[WheelSource, ...]
     platform_tag: str | None
 
+
+def _runtime_host_for_context(context: SetupContext) -> HostPlatform:
+    return HostPlatform(
+        system=context.system,
+        machine=context.machine,
+        gpu_sm=context.gpu_sm,
+        python_tag=context.python_tag,
+        python_version=context.python_version,
+    )
+
+
+def _safe_read_text(path: Path) -> str | None:
+    try:
+        if path.is_file():
+            return path.read_text(encoding="utf-8")
+    except Exception:
+        return None
+    return None
+
+
+def _summarize_trellis_patch_status(items: list[dict[str, object]], blocking_reasons: list[str]) -> str:
+    if blocking_reasons:
+        return "blocked"
+    statuses = {str(item.get("status", "")) for item in items}
+    if "applied" in statuses:
+        return "applied"
+    if "planned" in statuses:
+        return "planned"
+    if "already_applied" in statuses:
+        return "already_applied"
+    if statuses <= {"not_needed", ""}:
+        return "not_needed"
+    return "not_run"
+
+
+def _collect_trellis_patch_report(
+    context: SetupContext,
+    site_packages: Path,
+    *,
+    env: dict[str, str] | None = None,
+    apply_fdg_patch: bool = False,
+) -> dict[str, object]:
+    from runtime_patches import TRELLIS_CONFIG_RELATIVE_PATH, TRELLIS_DEBUG_RELATIVE_PATH, TRELLIS_FDG_VAE_RELATIVE_PATH
+
+    host = _runtime_host_for_context(context)
+    env_map = env if env is not None else dict(os.environ)
+    install_root = str(site_packages)
+
+    config_path = site_packages / TRELLIS_CONFIG_RELATIVE_PATH
+    debug_path = site_packages / TRELLIS_DEBUG_RELATIVE_PATH
+    fdg_path = site_packages / TRELLIS_FDG_VAE_RELATIVE_PATH
+
+    config_plan = build_flex_gemm_config_patch_plan(
+        host,
+        env_map,
+        installed_config_text=_safe_read_text(config_path),
+        install_root=install_root,
+    )
+    debug_plan = build_flex_gemm_debug_patch_plan(
+        env_map,
+        installed_debug_text=_safe_read_text(debug_path),
+        install_root=install_root,
+    )
+
+    fdg_text = _safe_read_text(fdg_path)
+    if fdg_text is None:
+        fdg_plan = {
+            "patch_name": "fdg_vae_mesh_compat",
+            "target_file": str(fdg_path),
+            "relative_path": TRELLIS_FDG_VAE_RELATIVE_PATH,
+            "status": "missing",
+            "backup_path": f"{fdg_path}.arm64-runtime.bak",
+            "backup_suffix": ".arm64-runtime.bak",
+            "expected_marker": "tiled_flexible_dual_grid_to_mesh",
+            "before_hash": "",
+            "after_hash": "",
+            "drift_reason": "fdg_vae.py is not present under the extracted trellis2_gguf runtime",
+            "patched_text": "",
+            "notes": ("No extracted fdg_vae.py file was available for planning.",),
+        }
+    elif apply_fdg_patch:
+        fdg_plan = apply_fdg_vae_patch_file(fdg_path).to_dict()
+    else:
+        fdg_plan = plan_fdg_vae_patch(fdg_text, install_root=install_root).to_dict()
+
+    items = [config_plan.to_dict(), debug_plan.to_dict(), fdg_plan]
+    blocking_reasons: list[str] = []
+    for item in items:
+        reason = str(item.get("blocking_reason", "") or item.get("drift_reason", "")).strip()
+        if reason:
+            blocking_reasons.append(reason)
+
+    report = TrellisPatchesReport(
+        status=_summarize_trellis_patch_status(items, blocking_reasons),
+        items=tuple(items),
+        blocking_reasons=tuple(blocking_reasons),
+    )
+    return report.to_dict()
+
+
+def _build_runtime_validation_report(
+    context: SetupContext,
+    selected_algo: str,
+    *,
+    runtime_env: RuntimeEnvironment | None = None,
+    env: dict[str, str] | None = None,
+    runner=subprocess.run,
+) -> dict[str, object]:
+    env_map = env if env is not None else dict(os.environ)
+    validation_python = _python(context.venv_dir)
+    validation_python_str = str(validation_python)
+    validation_gate_enabled = env_map.get(RUN_RUNTIME_VALIDATION_ENV, "").strip().lower() in {"1", "true", "yes", "on", "enabled"}
+
+    if validation_gate_enabled and not validation_python.is_file():
+        detail = (
+            "Runtime validation could not execute because the extension venv Python interpreter "
+            f"was not found at {validation_python_str}."
+        )
+        plans = build_no_generate_validation_plans(
+            selected_algo,
+            python_exe=validation_python_str,
+            extension_root=str(context.ext_dir),
+            enable_flex_gemm_debug=env_map.get(FLEX_GEMM_DEBUG_ENV, "").strip().lower() in {"1", "true", "yes", "on", "enabled"},
+            flex_gemm_debug_log_path=env_map.get(FLEX_GEMM_DEBUG_LOG_PATH_ENV) or None,
+        )
+        report = RuntimeValidationReport(
+            status="failed",
+            checks=tuple(
+                {
+                    "label": plan.label,
+                    "check_name": plan.check_name,
+                    "status": "not_run",
+                    "timeout_sec": plan.timeout_sec,
+                    "command": plan.command,
+                    "env": dict(plan.env),
+                    "constraints": plan.constraints,
+                    "notes": plan.notes,
+                    "returncode": None,
+                    "duration_sec": 0.0,
+                    "detail": detail,
+                    "stdout": "",
+                    "stderr": "",
+                }
+                for plan in plans
+            ),
+            blocking_reasons=(
+                f"runtime_validation:venv_python_missing: {detail}",
+            ),
+            warnings=(),
+        ).to_dict()
+    else:
+        report = run_no_generate_validation(
+            selected_algo,
+            python_exe=validation_python_str,
+            extension_root=str(context.ext_dir),
+            env=env_map,
+            enable_flex_gemm_debug=env_map.get(FLEX_GEMM_DEBUG_ENV, "").strip().lower() in {"1", "true", "yes", "on", "enabled"},
+            flex_gemm_debug_log_path=env_map.get(FLEX_GEMM_DEBUG_LOG_PATH_ENV) or None,
+            runner=runner,
+        ).to_dict()
+
+    warnings = [str(item) for item in report.get("warnings", ()) if str(item).strip()]
+    blocking_reasons = [str(item) for item in report.get("blocking_reasons", ()) if str(item).strip()]
+    final_env = runtime_env or _build_final_runtime_environment(context, {}, "")
+    if requires_arm64_generate_runtime_validation(final_env):
+        if report.get("status") != "passed":
+            if report.get("status") in {"not_run", "skipped", "planned", "pending"}:
+                blocking_reasons.append("Runtime validation is required for Linux ARM64 Blackwell Generate readiness but was not run.")
+            if not any(RUN_RUNTIME_VALIDATION_ENV in warning for warning in warnings):
+                warnings.append(
+                    f"Enable {RUN_RUNTIME_VALIDATION_ENV}=1 to execute the no-Generate runtime validation checks."
+                )
+    elif report.get("status") == "not_run":
+        warnings.append("Runtime validation remained optional on this non-target host and was not executed.")
+
+    report["blocking_reasons"] = blocking_reasons
+    report["warnings"] = warnings
+    return report
+
+
+def _build_wheel_provenance_report(
+    context: SetupContext,
+    torch_version: str,
+) -> dict[str, object]:
+    env = _build_native_runtime_environment(context, torch_version)
+    return collect_wheel_provenance(
+        tuple(lib.replace("-", "_") for lib in _CUDA_WHEELS_REQUIRED),
+        env,
+        context.wheel_sources,
+    )
+
+
+def _build_runtime_formalization_report(
+    context: SetupContext,
+    *,
+    torch_version: str,
+    site_packages: Path,
+    runtime_env: RuntimeEnvironment | None = None,
+    env: dict[str, str] | None = None,
+    apply_fdg_patch: bool = False,
+    triton_override: dict[str, object] | None = None,
+    runner=subprocess.run,
+) -> dict[str, object]:
+    host = _runtime_host_for_context(context)
+    env_map = env if env is not None else dict(os.environ)
+    runtime_overrides = build_runtime_overrides_report(
+        host,
+        env_map,
+        torch_version=torch_version,
+    ).to_dict()
+    if triton_override is not None:
+        runtime_overrides["triton"] = dict(triton_override)
+    selected_algo = str(runtime_overrides.get("flex_gemm", {}).get("selected", "implicit_gemm_splitk") or "implicit_gemm_splitk")
+    return {
+        "runtime_overrides": runtime_overrides,
+        "trellis_patches": _collect_trellis_patch_report(
+            context,
+            site_packages,
+            env=env_map,
+            apply_fdg_patch=apply_fdg_patch,
+        ),
+        "runtime_validation": _build_runtime_validation_report(
+            context,
+            selected_algo,
+            runtime_env=runtime_env,
+            env=env_map,
+            runner=runner,
+        ),
+        "wheel_provenance": _build_wheel_provenance_report(context, torch_version),
+    }
+
+
+def _refresh_runtime_formalization_after_native_deps(
+    context: SetupContext,
+    base_phase: dict[str, object],
+    dependency_results: dict[str, dict[str, object]],
+    torch_version: str,
+    *,
+    env: dict[str, str] | None = None,
+    runner=subprocess.run,
+) -> dict[str, object]:
+    runtime_formalization = dict(base_phase.get("runtime_formalization", {}))
+    runtime_overrides = dict(runtime_formalization.get("runtime_overrides", {}))
+    selected_algo = str(runtime_overrides.get("flex_gemm", {}).get("selected", "implicit_gemm_splitk") or "implicit_gemm_splitk")
+    runtime_env = _build_final_runtime_environment(context, dependency_results, torch_version)
+    runtime_formalization["runtime_validation"] = _build_runtime_validation_report(
+        context,
+        selected_algo,
+        runtime_env=runtime_env,
+        env=env,
+        runner=runner,
+    )
+    runtime_formalization["wheel_provenance"] = _build_wheel_provenance_report(context, torch_version)
+    return runtime_formalization
+
 def _pip(venv: Path, *args: str) -> None:
     is_win  = platform.system() == "Windows"
     pip_exe = venv / ("Scripts/pip.exe" if is_win else "bin/pip")
@@ -126,6 +402,64 @@ def _get_torch_version(venv: Path) -> str:
         return out
     except Exception:
         return ""
+
+
+def _get_triton_version(venv: Path) -> str:
+    """Return the installed Triton version string, or empty when absent."""
+    exe = _python(venv)
+    try:
+        out = subprocess.check_output(
+            [str(exe), "-c", "import importlib.metadata as m; print(m.version('triton'))"],
+            text=True,
+        ).strip()
+        return out
+    except Exception:
+        return ""
+
+
+def _apply_triton_override(
+    context: SetupContext,
+    torch_version: str,
+    *,
+    current_triton_version: str | None = None,
+    pip_runner=_pip,
+) -> dict[str, object]:
+    host = _runtime_host_for_context(context)
+    installed_version = current_triton_version
+    if installed_version is None:
+        installed_version = _get_triton_version(context.venv_dir)
+
+    plan = plan_triton_override(
+        host,
+        current_triton_version=installed_version or "",
+        torch_version=torch_version,
+    )
+    report = plan.to_dict()
+    report["plan_status"] = report["status"]
+    report["requested_spec"] = f"triton=={plan.target_version}" if plan.target_version else ""
+    report["runner_invoked"] = False
+
+    if not plan.targeted_host:
+        report["status"] = "not_target"
+        return report
+
+    if not plan.applies:
+        report["status"] = "skipped"
+        return report
+
+    report["runner_invoked"] = True
+    report["install_allowed"] = True
+    try:
+        pip_runner(context.venv_dir, "install", report["requested_spec"])
+    except Exception as exc:
+        report["status"] = "failed"
+        report["error"] = str(exc)
+        return report
+
+    report["status"] = "applied"
+    report["applied_version"] = plan.target_version or TRITON_OVERRIDE_VERSION
+    report["current_version"] = plan.target_version or TRITON_OVERRIDE_VERSION
+    return report
 
 
 def _python_tag() -> str:
@@ -736,6 +1070,9 @@ def _build_next_actions(
     dependency_results: dict[str, dict[str, object]],
     generate_report,
     refine_report,
+    *,
+    generate_ready: bool | None = None,
+    runtime_validation: dict[str, object] | None = None,
 ) -> list[str]:
     actions: list[str] = []
     missing_required = [
@@ -755,9 +1092,14 @@ def _build_next_actions(
         actions.append(
             "Re-run the extension setup/repair path to restore the required ComfyUI-GGUF support files."
         )
+    runtime_validation_status = str((runtime_validation or {}).get("status", "") or "")
+    if generate_ready is False and runtime_validation_status in {"not_run", "skipped", "planned", "pending", "failed"}:
+        actions.append(
+            "Do not claim Generate ready from dependency presence alone; required runtime validation is still blocked or not run."
+        )
     if refine_report.blockers:
         actions.append("Keep refine/texturing hidden until required dependency and runtime gates pass.")
-    if not missing_required and generate_report.allowed:
+    if not missing_required and (generate_ready if generate_ready is not None else generate_report.allowed):
         actions.append("Base setup completed and generate dependency gates are satisfied for this setup slice.")
     return actions
 
@@ -772,6 +1114,14 @@ def _build_setup_report(
     final_env = _build_final_runtime_environment(context, dependency_results, torch_version)
     generate_report = DependencyPreflight.evaluate("generate", final_env)
     refine_report = DependencyPreflight.evaluate("refine", final_env)
+    runtime_formalization = dict(base_phase.get("runtime_formalization", {}))
+    runtime_validation = dict(runtime_formalization.get("runtime_validation", {}))
+    trellis_patches = dict(runtime_formalization.get("trellis_patches", {}))
+    generate_capability = evaluate_generate_runtime_readiness(
+        generate_report,
+        runtime_validation=runtime_validation,
+        trellis_patches=trellis_patches,
+    )
 
     native_statuses = {result["status"] for result in dependency_results.values()}
     status = "success"
@@ -809,12 +1159,23 @@ def _build_setup_report(
         "wheel_sources": _serialize_wheel_sources(context.wheel_sources),
         "dependencies": dependency_results,
         "capabilities": {
-            "generate": _serialize_capability_report(generate_report),
+            "generate": generate_capability,
             "refine": _serialize_capability_report(refine_report),
         },
+        "runtime_overrides": runtime_formalization.get("runtime_overrides", {}),
+        "trellis_patches": trellis_patches,
+        "runtime_validation": runtime_validation,
+        "wheel_provenance": runtime_formalization.get("wheel_provenance", WheelProvenanceReport().to_dict()),
         "policy_notes": list(policy.get("policy_notes", ())),
         "phase0_policy_notes": list(policy.get("phase0_policy_notes", ())),
-        "next_actions": _build_next_actions(context, dependency_results, generate_report, refine_report),
+        "next_actions": _build_next_actions(
+            context,
+            dependency_results,
+            generate_report,
+            refine_report,
+            generate_ready=bool(generate_capability.get("allowed")),
+            runtime_validation=runtime_validation,
+        ),
     }
 
 
@@ -896,7 +1257,16 @@ def _phase1_install_base(context: SetupContext) -> dict[str, object]:
     if torch_ver:
         _install_triton_windows(context.venv_dir, torch_ver, context.gpu_sm)
 
+    triton_override = _apply_triton_override(context, torch_ver)
+
     _install_trellis2_gguf(context.venv_dir)
+    runtime_formalization = _build_runtime_formalization_report(
+        context,
+        torch_version=torch_ver,
+        site_packages=_site_packages(context.venv_dir),
+        apply_fdg_patch=True,
+        triton_override=triton_override,
+    )
     _install_comfyui_gguf(context.venv_dir)
 
     return {
@@ -908,6 +1278,7 @@ def _phase1_install_base(context: SetupContext) -> dict[str, object]:
         "optional_packages": optional_python_packages,
         "rembg": rembg_policy["summary"],
         "rembg_plan": rembg_policy,
+        "runtime_formalization": runtime_formalization,
     }
 
 
@@ -1113,6 +1484,12 @@ def setup_with_config(
 
     base_phase = _phase1_install_base(context)
     dependency_results, torch_version = _install_native_wheels(context)
+    base_phase["runtime_formalization"] = _refresh_runtime_formalization_after_native_deps(
+        context,
+        base_phase,
+        dependency_results,
+        torch_version,
+    )
 
     report = _build_setup_report(context, policy, base_phase, dependency_results, torch_version)
 
